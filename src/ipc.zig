@@ -178,36 +178,73 @@ pub const Info = extern struct {
     _reserved: [6]u8 = @splat(0),
 };
 
-pub fn send(fd: i32, tag: Tag, data: []const u8) !void {
-    const header = Header{
-        .tag = tag,
-        .len = @intCast(data.len),
-    };
-    const header_bytes = std.mem.asBytes(&header);
-    try writeAll(fd, header_bytes);
-    if (data.len > 0) {
-        try writeAll(fd, data);
+pub const Wire = enum {
+    current,
+    legacy,
+
+    fn header(self: Wire, tag: Tag, len: u32) [@sizeOf(Header)]u8 {
+        if (self == .current) return std.mem.asBytes(&Header{ .tag = tag, .len = len }).*;
+
+        // zmx 0.8.1 used a packed { u8, u32 } backed by eight bytes.
+        var bytes: [@sizeOf(Header)]u8 = @splat(0);
+        bytes[0] = switch (tag) {
+            .Manage => 22,
+            .Identity => 26,
+            else => @backingInt(tag),
+        };
+        std.mem.writeInt(u32, bytes[1..5], len, .little);
+        return bytes;
     }
+
+    fn decode(self: Wire, bytes: *const [@sizeOf(Header)]u8) Header {
+        return switch (self) {
+            .current => std.mem.bytesToValue(Header, bytes),
+            .legacy => .{
+                .tag = @fromBackingInt(@intCast(bytes[0])),
+                .len = std.mem.readInt(u32, bytes[1..5], .little),
+            },
+        };
+    }
+
+    pub fn append(
+        self: Wire,
+        alloc: std.mem.Allocator,
+        list: *std.ArrayList(u8),
+        tag: Tag,
+        data: []const u8,
+    ) !void {
+        try list.ensureUnusedCapacity(alloc, @sizeOf(Header) + data.len);
+        list.appendSliceAssumeCapacity(&self.header(tag, @intCast(data.len)));
+        list.appendSliceAssumeCapacity(data);
+    }
+};
+
+pub fn send(fd: i32, tag: Tag, data: []const u8) !void {
+    try (Connection{ .fd = fd, .wire = .current }).send(tag, data);
 }
 
 pub fn appendMessage(
-    gpa: std.mem.Allocator,
+    alloc: std.mem.Allocator,
     list: *std.ArrayList(u8),
     tag: Tag,
     data: []const u8,
 ) !void {
-    const header = Header{
-        .tag = tag,
-        .len = @intCast(data.len),
-    };
-    // Guarantee capacity for header + payload in one check to avoid
-    // intermediate realloc between the two appends on the hot path.
-    try list.ensureTotalCapacity(gpa, list.items.len + @sizeOf(Header) + data.len);
-    list.appendSliceAssumeCapacity(std.mem.asBytes(&header));
-    if (data.len > 0) {
-        list.appendSliceAssumeCapacity(data);
-    }
+    try Wire.current.append(alloc, list, tag, data);
 }
+
+pub const Connection = struct {
+    fd: i32,
+    wire: Wire,
+
+    pub fn close(self: Connection) void {
+        lib_posix.close(self.fd);
+    }
+
+    pub fn send(self: Connection, tag: Tag, data: []const u8) !void {
+        try writeAll(self.fd, &self.wire.header(tag, @intCast(data.len)));
+        try writeAll(self.fd, data);
+    }
+};
 
 fn writeAll(fd: i32, data: []const u8) !void {
     var index: usize = 0;
@@ -235,6 +272,7 @@ pub const SocketMsg = struct {
 };
 
 pub const SocketBuffer = struct {
+    wire: Wire = .current,
     buf: std.ArrayList(u8),
     alloc: std.mem.Allocator,
     head: usize,
@@ -282,7 +320,7 @@ pub const SocketBuffer = struct {
         const available = self.buf.items[self.head..];
         if (available.len < @sizeOf(Header)) return null;
 
-        const hdr = std.mem.bytesToValue(Header, available[0..@sizeOf(Header)]);
+        const hdr = self.wire.decode(available[0..@sizeOf(Header)]);
         if (hdr.len > MAX_PAYLOAD_LEN or hdr.protocol_version != PROTOCOL_VERSION) {
             // framing error / corrupted stream: clear buffer to avoid
             // infinite alloc
@@ -320,77 +358,157 @@ const SessionProbeError = error{
     Unexpected,
     InfoSizeMismatch,
     Unsupported,
+    Ambiguous,
 };
 
 const SessionProbeResult = struct {
-    fd: i32,
+    connection: Connection,
     info: Info,
     labels: ?[]const u8,
     alloc: std.mem.Allocator,
 
     pub fn deinit(self: *const SessionProbeResult) void {
         if (self.labels) |lbl| self.alloc.free(lbl);
-        lib_posix.close(self.fd);
+        self.connection.close();
     }
 };
+
+const ProtocolProbe = struct { connection: Connection, info: Info };
+
+/// Info, Kill and DetachAll ignore their payload. A current header with a
+/// zero length reads as a legacy header with length one because the legacy
+/// length starts at the byte that now holds PROTOCOL_VERSION. Supply that
+/// byte so either daemon can handle the request immediately.
+pub fn sendOneShot(fd: i32, tag: enum { info, kill, detach_all }) !void {
+    const wire_tag: Tag = switch (tag) {
+        .info => .Info,
+        .kill => .Kill,
+        .detach_all => .DetachAll,
+    };
+    try writeAll(fd, &(Wire.current.header(wire_tag, 0) ++ [1]u8{0}));
+}
+
+fn readProbeBytes(fd: i32, bytes: []u8) SessionProbeError!void {
+    var rest = bytes;
+    while (rest.len != 0) {
+        var pfd = [_]lib_posix.pollfd{.{ .fd = fd, .events = lib_posix.POLL.IN, .revents = 0 }};
+        if ((lib_posix.poll(&pfd, 1000) catch return error.Unexpected) == 0) return error.Timeout;
+        const n = lib_posix.read(fd, rest) catch return error.Unexpected;
+        if (n == 0) return error.Unexpected;
+        rest = rest[n..];
+    }
+}
+
+/// Retries a reply `probeFraming` cannot settle on a fresh connection, three attempts in all.
+fn probeProtocol(socket_path: []const u8) SessionProbeError!ProtocolProbe {
+    for (0..2) |_| return probeOnce(socket_path) catch |err| switch (err) {
+        error.Ambiguous => continue,
+        else => return err,
+    };
+    return probeOnce(socket_path) catch |err| if (err == error.Ambiguous) error.Unexpected else err;
+}
+
+fn probeOnce(socket_path: []const u8) SessionProbeError!ProtocolProbe {
+    const fd = try connectSession(socket_path);
+    errdefer lib_posix.close(fd);
+    sendOneShot(fd, .info) catch return error.Unexpected;
+
+    const reply = try readProbeReply(fd);
+    const wire = reply.wire;
+    const connection_fd = switch (wire) {
+        .legacy => fd,
+        // The current daemon has one extra byte buffered from the probe.
+        .current => blk: {
+            const fresh = try connectSession(socket_path);
+            lib_posix.close(fd);
+            break :blk fresh;
+        },
+    };
+    return .{ .connection = .{ .fd = connection_fd, .wire = wire }, .info = reply.info };
+}
+
+fn readProbeReply(fd: i32) SessionProbeError!struct { wire: Wire, info: Info } {
+    var header_bytes: [@sizeOf(Header)]u8 = undefined;
+    try readProbeBytes(fd, &header_bytes);
+    // output or a task completion can arrive before the Info reply
+    const wire = try probeFraming(fd, &header_bytes);
+    while (true) : (try readProbeBytes(fd, &header_bytes)) {
+        const hdr = wire.decode(&header_bytes);
+        if (hdr.protocol_version != PROTOCOL_VERSION) return error.Unexpected;
+
+        switch (hdr.tag) {
+            .Info => {
+                if (hdr.len != @sizeOf(Info)) return error.InfoSizeMismatch;
+                var info: Info = undefined;
+                try readProbeBytes(fd, std.mem.asBytes(&info));
+                return .{ .wire = wire, .info = info };
+            },
+            .Output, .TaskComplete => {
+                if (hdr.len == 0 or hdr.len > MAX_PAYLOAD_LEN) return error.Unexpected;
+                try discardProbeBytes(fd, hdr.len);
+            },
+            else => return error.Unexpected,
+        }
+    }
+}
+
+/// Picks the framing of a reply opening with `header_bytes`, leaving the next header to read there.
+/// The nine bytes after an Output that reads both ways arrive in either framing; it is current only
+/// when their last eight cannot open a legacy frame, since raw output can hold any header.
+fn probeFraming(fd: i32, header_bytes: *[@sizeOf(Header)]u8) SessionProbeError!Wire {
+    const as_current = opensProbeReply(.current, Wire.current.decode(header_bytes));
+    const as_legacy = opensProbeReply(.legacy, Wire.legacy.decode(header_bytes));
+    if (as_current != as_legacy) return if (as_current) .current else .legacy;
+    if (!as_current) return error.Unexpected;
+
+    var after: [1 + @sizeOf(Header)]u8 = undefined;
+    try readProbeBytes(fd, &after);
+    if (opensProbeReply(.legacy, Wire.legacy.decode(after[1..]))) return error.Ambiguous;
+    try discardProbeBytes(fd, Wire.current.decode(header_bytes).len - after.len);
+    try readProbeBytes(fd, header_bytes);
+    return .current;
+}
+
+fn discardProbeBytes(fd: i32, len: usize) SessionProbeError!void {
+    var remaining = len;
+    var discard: [4096]u8 = undefined;
+    while (remaining > 0) {
+        const n = @min(remaining, discard.len);
+        try readProbeBytes(fd, discard[0..n]);
+        remaining -= n;
+    }
+}
+
+/// Whether `hdr` can open a probe reply in `wire`'s framing. TaskComplete carries one byte and Info
+/// its 552 in both, so only Output reads both ways: a legacy one-byte Output whose packed header
+/// carries padding, or a current Output whose length is a multiple of 256.
+fn opensProbeReply(wire: Wire, hdr: Header) bool {
+    if (hdr.protocol_version != PROTOCOL_VERSION or hdr._reserved != 0) return false;
+    // 0.8.1 relays its PTY in 4 KiB reads; a current header's nonzero low length byte reads as 2^24 or more
+    const max_output: usize = if (wire == .legacy) (1 << 24) - 1 else MAX_PAYLOAD_LEN;
+    return switch (hdr.tag) {
+        .Info => hdr.len == @sizeOf(Info),
+        .TaskComplete => hdr.len == 1,
+        .Output => hdr.len != 0 and hdr.len <= max_output,
+        else => false,
+    };
+}
+
+pub fn connectProtocol(socket_path: []const u8) SessionProbeError!Connection {
+    return (try probeProtocol(socket_path)).connection;
+}
 
 pub fn probeSession(
     alloc: std.mem.Allocator,
     socket_path: []const u8,
 ) SessionProbeError!SessionProbeResult {
-    const timeout_ms = 1000;
-    const fd = try connectSession(socket_path);
-    errdefer lib_posix.close(fd);
-
-    send(fd, .Info, "") catch return error.Unexpected;
-    send(fd, .LabelGet, "") catch {};
-
-    var poll_fds = [_]lib_posix.pollfd{.{ .fd = fd, .events = lib_posix.POLL.IN, .revents = 0 }};
-    const poll_result = lib_posix.poll(&poll_fds, timeout_ms) catch return error.Unexpected;
-    if (poll_result == 0) {
-        return error.Timeout;
-    }
-
-    var sb = SocketBuffer.init(alloc) catch return error.Unexpected;
-    defer sb.deinit();
-
-    const n = sb.read(fd) catch return error.Unexpected;
-    if (n == 0) return error.Unexpected;
-
-    var info_result: ?Info = null;
-    var labels: ?[]const u8 = null;
-    errdefer if (labels) |lbl| alloc.free(lbl);
-
-    while (true) {
-        if (sb.next()) |msg| {
-            if (msg.header.tag == .Info) {
-                if (msg.payload.len != @sizeOf(Info)) return error.InfoSizeMismatch;
-                info_result = std.mem.bytesToValue(Info, msg.payload[0..@sizeOf(Info)]);
-            }
-            if (msg.header.tag == .LabelData) {
-                labels = alloc.dupe(u8, msg.payload) catch null;
-            }
-
-            if (info_result != null and labels != null) break;
-            continue;
-        }
-
-        // No complete message available, wait for more data
-        const more = lib_posix.poll(&poll_fds, 50) catch break;
-        if (more == 0) break;
-        const n_read = sb.read(fd) catch break;
-        if (n_read == 0) break;
-    }
-
-    if (info_result) |info| {
-        return .{
-            .fd = fd,
-            .info = info,
-            .labels = labels,
-            .alloc = alloc,
-        };
-    }
-    return error.Unexpected;
+    const probe = try probeProtocol(socket_path);
+    const connection = probe.connection;
+    const labels = blk: {
+        connection.send(.LabelGet, "") catch break :blk null;
+        break :blk readReply(alloc, connection, .LabelData, 50) catch null;
+    };
+    return .{ .connection = connection, .info = probe.info, .labels = labels, .alloc = alloc };
 }
 
 //  WIRE PROTOCOL FREEZE: read before "fixing" any test below.
@@ -429,33 +547,9 @@ pub fn roundTripForTag(
     payload: []const u8,
     expected_tag: Tag,
 ) SessionProbeError![]u8 {
-    const timeout_ms = 1000;
-    const fd = try connectSession(socket_path);
-    defer lib_posix.close(fd);
-
-    send(fd, request_tag, payload) catch return error.Unexpected;
-
-    var poll_fds = [_]lib_posix.pollfd{.{ .fd = fd, .events = lib_posix.POLL.IN, .revents = 0 }};
-    const poll_result = lib_posix.poll(&poll_fds, timeout_ms) catch return error.Unexpected;
-    if (poll_result == 0) return error.Timeout;
-
-    var sb = SocketBuffer.init(alloc) catch return error.Unexpected;
-    defer sb.deinit();
-
-    const n = sb.read(fd) catch return error.Unexpected;
-    if (n == 0) return error.Unexpected;
-
-    while (sb.next()) |msg| {
-        if (msg.header.tag == .Unsupported) return error.Unsupported;
-        if (msg.header.tag == expected_tag) {
-            return alloc.dupe(u8, msg.payload) catch return error.Unexpected;
-        }
-    }
-    return error.Unexpected;
+    return roundTripLarge(alloc, socket_path, request_tag, payload, expected_tag, 1000);
 }
 
-/// Like `roundTripForTag`, for a reply larger than one socket read. `timeout_ms`
-/// bounds each wait, so a daemon that ignores the request tag ends in `Timeout`.
 pub fn roundTripLarge(
     alloc: std.mem.Allocator,
     socket_path: []const u8,
@@ -464,13 +558,22 @@ pub fn roundTripLarge(
     expected_tag: Tag,
     timeout_ms: i32,
 ) SessionProbeError![]u8 {
-    const fd = try connectSession(socket_path);
-    defer lib_posix.close(fd);
+    const connection = try connectProtocol(socket_path);
+    defer connection.close();
+    connection.send(request_tag, payload) catch return error.Unexpected;
+    return readReply(alloc, connection, expected_tag, timeout_ms);
+}
 
-    send(fd, request_tag, payload) catch return error.Unexpected;
-
+fn readReply(
+    alloc: std.mem.Allocator,
+    connection: Connection,
+    expected_tag: Tag,
+    timeout_ms: i32,
+) SessionProbeError![]u8 {
+    const fd = connection.fd;
     var sb = SocketBuffer.init(alloc) catch return error.Unexpected;
     defer sb.deinit();
+    sb.wire = connection.wire;
 
     while (true) {
         var poll_fds = [_]lib_posix.pollfd{.{ .fd = fd, .events = lib_posix.POLL.IN, .revents = 0 }};
@@ -498,4 +601,101 @@ test "zeroed Info has no stack garbage in wire bytes" {
     // Tail padding after task_exit_code must be zero (asBytes ships it).
     const last_field_end = @offsetOf(Info, "task_exit_code") + @sizeOf(u8);
     for (bytes[last_field_end..]) |b| try std.testing.expectEqual(@as(u8, 0), b);
+}
+
+test "legacy headers carry agterm 0.8.1 tag numbers" {
+    inline for (.{ .{ Tag.Manage, 22 }, .{ Tag.Identity, 26 }, .{ Tag.Role, 23 }, .{ Tag.Screen, 24 }, .{ Tag.Type, 25 }, .{ Tag.Init, 7 } }) |p| {
+        const bytes = Wire.legacy.header(p[0], 3);
+        try std.testing.expectEqual(@as(u8, p[1]), bytes[0]);
+        try std.testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, bytes[1..5], .little));
+    }
+}
+
+test "probe identifies both wire formats after unsolicited output" {
+    for ([_]Wire{ .current, .legacy }) |wire| {
+        var fds: [2]i32 = undefined;
+        if (std.c.socketpair(lib_posix.AF.UNIX, lib_posix.SOCK.STREAM, 0, &fds) != 0) return error.NoSocketPair;
+        defer for (fds) |fd| lib_posix.close(fd);
+
+        const peer: Connection = .{ .fd = fds[0], .wire = wire };
+        try peer.send(.Output, "$");
+        try peer.send(.TaskComplete, "\x00");
+        var info = std.mem.zeroes(Info);
+        info.pid = 123;
+        try peer.send(.Info, std.mem.asBytes(&info));
+
+        const reply = try readProbeReply(fds[1]);
+        try std.testing.expectEqual(wire, reply.wire);
+        try std.testing.expectEqual(info.pid, reply.info.pid);
+    }
+}
+
+test "probe settles a busy current daemon's first frame that reads in both framings" {
+    // regression: a busy daemon's 4096-byte Output reads as a padded 0.8.1 one-byte Output
+    var fds: [2]i32 = undefined;
+    if (std.c.socketpair(lib_posix.AF.UNIX, lib_posix.SOCK.STREAM, 0, &fds) != 0) return error.NoSocketPair;
+    defer for (fds) |fd| lib_posix.close(fd);
+    var text: [4096]u8 = undefined;
+    @memset(&text, 'y');
+    var info = std.mem.zeroes(Info);
+    info.pid = 321;
+    const peer: Connection = .{ .fd = fds[0], .wire = .current };
+    try peer.send(.Output, &text);
+    try peer.send(.Info, std.mem.asBytes(&info));
+
+    const reply = try readProbeReply(fds[1]);
+    try std.testing.expectEqual(Wire.current, reply.wire);
+    try std.testing.expectEqual(info.pid, reply.info.pid);
+}
+
+test "probe refuses to guess when the bytes after an ambiguous frame open a legacy one" {
+    var fake = std.mem.zeroes(Info);
+    fake.pid = 666;
+    var info = std.mem.zeroes(Info);
+    info.pid = 321;
+    const padded_output = [_]u8{ 1, 1, 0, 0, 0, 0, 1, 0, 'x' };
+    const legacy_info = Wire.legacy.header(.Info, @sizeOf(Info)) ++ std.mem.toBytes(info);
+    var current_output: [@sizeOf(Header) + 4096]u8 = undefined;
+    current_output[0..@sizeOf(Header)].* = Wire.current.header(.Output, 4096);
+    @memset(current_output[@sizeOf(Header)..], 'y');
+    current_output[@sizeOf(Header) + 1 ..][0 .. @sizeOf(Header) + @sizeOf(Info)].* =
+        Wire.legacy.header(.Info, @sizeOf(Info)) ++ std.mem.toBytes(fake);
+    const current_info = Wire.current.header(.Info, @sizeOf(Info)) ++ std.mem.toBytes(info);
+    const cases = [_][]const []const u8{ &.{ &padded_output, &legacy_info }, &.{ &current_output, &current_info } };
+    for (cases) |frames| {
+        var fds: [2]i32 = undefined;
+        if (std.c.socketpair(lib_posix.AF.UNIX, lib_posix.SOCK.STREAM, 0, &fds) != 0) return error.NoSocketPair;
+        defer for (fds) |fd| lib_posix.close(fd);
+        for (frames) |frame| try writeAll(fds[0], frame);
+        try std.testing.expectError(error.Ambiguous, readProbeReply(fds[1]));
+    }
+}
+
+test "probe reads a padded legacy task completion as legacy" {
+    var fds: [2]i32 = undefined;
+    if (std.c.socketpair(lib_posix.AF.UNIX, lib_posix.SOCK.STREAM, 0, &fds) != 0) return error.NoSocketPair;
+    defer for (fds) |fd| lib_posix.close(fd);
+    try writeAll(fds[0], &[_]u8{ 13, 1, 0, 0, 0, 7, 7, 7, 0 });
+    var info = std.mem.zeroes(Info);
+    info.pid = 77;
+    try (Connection{ .fd = fds[0], .wire = .legacy }).send(.Info, std.mem.asBytes(&info));
+
+    const reply = try readProbeReply(fds[1]);
+    try std.testing.expectEqual(Wire.legacy, reply.wire);
+    try std.testing.expectEqual(info.pid, reply.info.pid);
+}
+
+test "a one-shot request reads as a one-byte request on a 0.8.1 daemon" {
+    var fds: [2]i32 = undefined;
+    if (std.c.socketpair(lib_posix.AF.UNIX, lib_posix.SOCK.STREAM, 0, &fds) != 0) return error.NoSocketPair;
+    defer for (fds) |fd| lib_posix.close(fd);
+    try sendOneShot(fds[0], .info);
+    var bytes: [@sizeOf(Header) + 1]u8 = undefined;
+    try readProbeBytes(fds[1], &bytes);
+
+    try std.testing.expectEqual(@as(u32, 0), Wire.current.decode(bytes[0..@sizeOf(Header)]).len);
+    const legacy = Wire.legacy.decode(bytes[0..@sizeOf(Header)]);
+    try std.testing.expectEqual(Tag.Info, legacy.tag);
+    try std.testing.expectEqual(@as(u32, 1), legacy.len);
+    try std.testing.expectEqual(@as(u8, 0), bytes[@sizeOf(Header)]);
 }

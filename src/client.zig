@@ -134,11 +134,11 @@ fn attachInner(alloc: Allocator, io: Io, name: []const u8, opts: AttachOptions, 
         defer cfg.deinit(alloc);
         const socket_path = try socket.getSocketPath(alloc, cfg.socket_dir, cur_sesh);
         defer alloc.free(socket_path);
-        const fd = try socket.sessionConnect(socket_path);
-        defer lib_posix.close(fd);
+        const connection = try ipc.connectProtocol(socket_path);
+        defer connection.close();
         const target_sesh = try socket.getSeshName(alloc, name);
         defer alloc.free(target_sesh);
-        ipc.send(fd, .Switch, target_sesh) catch |err| switch (err) {
+        connection.send(.Switch, target_sesh) catch |err| switch (err) {
             error.BrokenPipe, error.ConnectionResetByPeer => return,
             else => return err,
         };
@@ -167,7 +167,7 @@ fn attachInner(alloc: Allocator, io: Io, name: []const u8, opts: AttachOptions, 
         try set(alloc, io, name, kvs);
     }
 
-    const client_sock = try socket.sessionConnect(socket_path);
+    const connection = try ipc.connectProtocol(socket_path);
 
     var orig_termios: cross.termios = undefined;
     const stdin_is_tty = cross.tcgetattr(lib_posix.STDIN_FILENO, &orig_termios) == 0;
@@ -200,7 +200,7 @@ fn attachInner(alloc: Allocator, io: Io, name: []const u8, opts: AttachOptions, 
     _ = try lib_posix.write(lib_posix.STDOUT_FILENO, clear_seq);
 
     const env_str = opts.tracked_env orelse "";
-    const looper = try loop.clientLoop(client_sock, env_str, socket_path);
+    const looper = try loop.clientLoop(connection, env_str, socket_path);
     close_deadline.* = looper.close_deadline_ms;
     switch (looper.kind) {
         .detach => return,
@@ -242,7 +242,7 @@ pub fn detach(alloc: Allocator, io: Io, name: []const u8) !void {
     };
     defer lib_posix.close(fd);
 
-    ipc.send(fd, .DetachAll, "") catch |err| switch (err) {
+    ipc.sendOneShot(fd, .detach_all) catch |err| switch (err) {
         error.BrokenPipe, error.ConnectionResetByPeer => return,
         else => return err,
     };
@@ -289,7 +289,7 @@ pub fn kill(alloc: Allocator, io: Io, name: []const u8, opts: KillOptions) !Kill
     };
     defer lib_posix.close(fd);
 
-    ipc.send(fd, .Kill, "") catch |err| switch (err) {
+    ipc.sendOneShot(fd, .kill) catch |err| switch (err) {
         error.BrokenPipe, error.ConnectionResetByPeer => return .killed,
         else => return err,
     };
@@ -498,8 +498,11 @@ pub fn run(
 
     if (cmd_to_send == null) return error.CommandRequired;
 
-    const client_sock = try socket.sessionConnect(socket_path);
+    // a current probe hands back a connection nothing has read from, and Run is not sent yet
+    const connection = try ipc.connectProtocol(socket_path);
+    const client_sock = connection.fd;
     defer lib_posix.close(client_sock);
+    if (connection.wire == .legacy) return error.RunNotSupported;
 
     const term_size = ipc.getTerminalSize(lib_posix.STDOUT_FILENO);
     ipc.send(client_sock, .Resize, std.mem.asBytes(&term_size)) catch {};
@@ -630,6 +633,10 @@ pub fn tail(alloc: Allocator, io: Io, names: []const []const u8, writer: ?*Io.Wr
         defer alloc.free(socket_path);
         const sock = try socket.sessionConnect(socket_path);
         try fds.append(alloc, sock);
+        // probed after subscribing, so a task that ends meanwhile still reaches `sock`
+        const probe = try ipc.connectProtocol(socket_path);
+        lib_posix.close(probe.fd);
+        if (probe.wire == .legacy) return error.TailNotSupported;
     }
 
     return tailInternal(alloc, fds.items, false, false, writer);
@@ -656,7 +663,7 @@ pub fn send(alloc: Allocator, io: Io, name: []const u8, bytes: []const u8) !void
     };
     defer probe_result.deinit();
 
-    ipc.send(probe_result.fd, .Send, bytes) catch |err| switch (err) {
+    probe_result.connection.send(.Send, bytes) catch |err| switch (err) {
         error.ConnectionResetByPeer, error.BrokenPipe => return,
         else => return err,
     };
@@ -683,7 +690,7 @@ pub fn print(alloc: Allocator, io: Io, name: []const u8, bytes: []const u8) !voi
     };
     defer probe_result.deinit();
 
-    ipc.send(probe_result.fd, .Output, bytes) catch |err| switch (err) {
+    probe_result.connection.send(.Output, bytes) catch |err| switch (err) {
         error.ConnectionResetByPeer, error.BrokenPipe => return,
         else => return err,
     };
@@ -709,6 +716,8 @@ pub fn write(alloc: Allocator, io: Io, name: []const u8, remote_path: []const u8
         return error.SessionUnresponsive;
     };
     defer result.deinit();
+    // 0.8.1 queues the whole file past its input cap, drops the overflow and still acks
+    if (result.connection.wire == .legacy) return error.WriteNotSupported;
 
     var wire_buf = try std.ArrayList(u8).initCapacity(alloc, @sizeOf(u32) + remote_path.len + content.len);
     defer wire_buf.deinit(alloc);
@@ -717,15 +726,16 @@ pub fn write(alloc: Allocator, io: Io, name: []const u8, remote_path: []const u8
     try wire_buf.appendSlice(alloc, remote_path);
     try wire_buf.appendSlice(alloc, content);
 
-    ipc.send(result.fd, .Write, wire_buf.items) catch |err| switch (err) {
+    result.connection.send(.Write, wire_buf.items) catch |err| switch (err) {
         error.BrokenPipe, error.ConnectionResetByPeer => return,
         else => return err,
     };
 
     var sb = try ipc.SocketBuffer.init(alloc);
     defer sb.deinit();
+    sb.wire = result.connection.wire;
 
-    const n = sb.read(result.fd) catch return error.ReadFailed;
+    const n = sb.read(result.connection.fd) catch return error.ReadFailed;
     if (n == 0) return error.ConnectionClosed;
 
     while (sb.next()) |msg| {
@@ -752,26 +762,29 @@ pub fn historyRange(alloc: Allocator, io: Io, name: []const u8, format: HistoryF
     const exists = try socket.sessionExists(io, dir, sesh);
     if (!exists) return error.SessionNotFound;
 
-    const fd = ipc.connectSession(socket_path) catch |err| {
+    const connection = ipc.connectProtocol(socket_path) catch |err| {
         if (err == error.ConnectionRefused) socket.cleanupStaleSocket(io, dir, sesh);
         return error.SessionUnresponsive;
     };
-    defer lib_posix.close(fd);
+    defer connection.close();
+    const fd = connection.fd;
 
     const reply_tag: ipc.Tag = if (scrollback_rows != null) .Capture else .History;
     if (scrollback_rows) |rows| {
+        if (connection.wire == .legacy) return error.CaptureNotSupported;
         var request = std.mem.zeroes(ipc.Capture);
         request.format = @backingInt(format);
         request.rows = rows;
-        try ipc.send(fd, .Capture, std.mem.asBytes(&request));
-        try ipc.send(fd, .Info, "");
+        try connection.send(.Capture, std.mem.asBytes(&request));
+        try connection.send(.Info, "");
     } else {
         const format_byte = [_]u8{@backingInt(format)};
-        try ipc.send(fd, .History, &format_byte);
+        try connection.send(.History, &format_byte);
     }
 
     var sb = try ipc.SocketBuffer.init(alloc);
     defer sb.deinit();
+    sb.wire = connection.wire;
 
     while (true) {
         var poll_fds = [_]lib_posix.pollfd{.{ .fd = fd, .events = lib_posix.POLL.IN, .revents = 0 }};

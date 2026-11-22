@@ -267,6 +267,7 @@ fn mainImpl(init: std.process.Init) !void {
             .stdin_bytes = stdin_bytes,
         }) catch |err| switch (err) {
             error.CommandRequired => return printError(io, "run requires a command (or pipe input via stdin)", .{}),
+            error.RunNotSupported => return printError(io, "session \"{s}\" does not support run (daemon too old?)", .{session_name}),
             else => return printError(io, "session not ready: {s}", .{@errorName(err)}),
         };
         lib_posix.exit(exit_code);
@@ -428,6 +429,7 @@ fn mainImpl(init: std.process.Init) !void {
         }
         _ = zmx.tail(gpa, io, names.items, null) catch |err| switch (err) {
             error.SessionNotFound => return printError(io, "no matching sessions found", .{}),
+            error.TailNotSupported => return printError(io, "a matching session does not support tail (daemon too old?)", .{}),
             else => return err,
         };
     } else if (std.mem.eql(u8, cmd, "write") or std.mem.eql(u8, cmd, "wr")) {
@@ -1234,6 +1236,7 @@ fn writeFile(gpa: std.mem.Allocator, io: std.Io, session_name: []const u8, file_
     }
 
     zmx.write(gpa, io, session_name, file_path, stdin_buf.items) catch |err| {
+        if (err == error.WriteNotSupported) return printError(io, "session \"{s}\" does not support write (daemon too old?)", .{session_name});
         if (err == error.SessionUnresponsive) {
             var errbuf: [4096]u8 = undefined;
             var ew = std.Io.File.stderr().writer(io, &errbuf);

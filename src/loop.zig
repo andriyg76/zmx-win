@@ -28,8 +28,8 @@ fn resetShare(stdout_fd: i32) i64 {
 
 /// clientLoop sends ipc commands to its corresponding daemon.  It uses poll() as its non-blocking
 /// mechanism. It will send stdin to the daemon and receive stdout from the daemon.
-pub fn clientLoop(client_sock_fd: i32, env_str: []const u8, session_path: []const u8) !ClientResult {
-    return clientLoopOn(client_sock_fd, env_str, session_path, lib_posix.STDIN_FILENO, lib_posix.STDOUT_FILENO);
+pub fn clientLoop(connection: ipc.Connection, env_str: []const u8, session_path: []const u8) !ClientResult {
+    return clientLoopOn(connection, env_str, session_path, lib_posix.STDIN_FILENO, lib_posix.STDOUT_FILENO);
 }
 
 /// A daemon whose session ended unlinks its socket before it closes its clients, so a hangup with the socket
@@ -47,7 +47,8 @@ fn sessionEnding(close_deadline: *?i64, session_path: []const u8) bool {
     return true;
 }
 
-fn clientLoopOn(client_sock_fd: i32, env_str: []const u8, session_path: []const u8, stdin_fd: i32, stdout_fd: i32) !ClientResult {
+fn clientLoopOn(connection: ipc.Connection, env_str: []const u8, session_path: []const u8, stdin_fd: i32, stdout_fd: i32) !ClientResult {
+    const client_sock_fd = connection.fd;
     std.log.info("client loop fd={d}", .{client_sock_fd});
     const gpa: std.mem.Allocator = blk: {
         if (builtin.mode == .debug) {
@@ -78,28 +79,29 @@ fn clientLoopOn(client_sock_fd: i32, env_str: []const u8, session_path: []const 
     defer sock_write_buf.deinit(gpa);
 
     if (env_str.len > 0) {
-        try ipc.appendMessage(gpa, &sock_write_buf, .EnvSet, env_str);
+        try connection.wire.append(gpa, &sock_write_buf, .EnvSet, env_str);
     }
 
     var relay: ?role.Relay = if (role.nonceFromEnv()) |nonce| role.Relay.init(nonce) else null;
     defer if (relay) |*r| r.deinit();
     if (relay) |r| {
         const flags = ipc.ManageFlags{ .claim = role.claimFromEnv() };
-        try ipc.appendMessage(gpa, &sock_write_buf, .Manage, std.mem.asBytes(&flags));
+        try connection.wire.append(gpa, &sock_write_buf, .Manage, std.mem.asBytes(&flags));
         // an older daemon ignores the tag, so a reclaim there leaves the lead where it is
         var id_buf: role.IdentityBuf = undefined;
-        try ipc.appendMessage(gpa, &sock_write_buf, .Identity, role.identity(&id_buf, r.nonce, role.reclaimFromEnv()));
+        try connection.wire.append(gpa, &sock_write_buf, .Identity, role.identity(&id_buf, r.nonce, role.reclaimFromEnv()));
     }
 
     // Send init message with terminal size (buffered)
     const size = ipc.getTerminalSize(stdout_fd);
-    try ipc.appendMessage(gpa, &sock_write_buf, .Init, std.mem.asBytes(&size));
+    try connection.wire.append(gpa, &sock_write_buf, .Init, std.mem.asBytes(&size));
 
     var poll_fds = try std.ArrayList(lib_posix.pollfd).initCapacity(gpa, 4);
     defer poll_fds.deinit(gpa);
 
     var read_buf = try ipc.SocketBuffer.init(gpa);
     defer read_buf.deinit();
+    read_buf.wire = connection.wire;
 
     var stdout_buf = try std.ArrayList(u8).initCapacity(gpa, 4096);
     defer stdout_buf.deinit(gpa);
@@ -174,7 +176,7 @@ fn clientLoopOn(client_sock_fd: i32, env_str: []const u8, session_path: []const 
         if (poll_fds.items[2].revents & lib_posix.POLL.IN != 0) {
             try signal.drainSignalPipe();
             const next_size = ipc.getTerminalSize(stdout_fd);
-            try ipc.appendMessage(
+            try connection.wire.append(
                 gpa,
                 &sock_write_buf,
                 .Resize,
@@ -196,9 +198,9 @@ fn clientLoopOn(client_sock_fd: i32, env_str: []const u8, session_path: []const 
                     // Check for detach sequences (ctrl+\ as first byte or Kitty escape sequence)
                     if (!detach_key_disabled and util.isCtrlBackslash(buf[0..n])) {
                         std.log.info("detach key detected", .{});
-                        try ipc.appendMessage(gpa, &sock_write_buf, .Detach, "");
+                        try connection.wire.append(gpa, &sock_write_buf, .Detach, "");
                     } else {
-                        try ipc.appendMessage(gpa, &sock_write_buf, .Input, buf[0..n]);
+                        try connection.wire.append(gpa, &sock_write_buf, .Input, buf[0..n]);
                     }
                 } else {
                     std.log.info("eof stdin", .{});
@@ -244,7 +246,7 @@ fn clientLoopOn(client_sock_fd: i32, env_str: []const u8, session_path: []const 
                         // daemon is asking for the client's window size usually in response
                         // to this client being set as leader.
                         const next_size = ipc.getTerminalSize(stdout_fd);
-                        try ipc.appendMessage(
+                        try connection.wire.append(
                             gpa,
                             &sock_write_buf,
                             .Resize,
@@ -1529,7 +1531,7 @@ pub const Daemon = struct {
         payload: []const u8,
     ) !void {
         defer client.has_pending_output = true;
-        const mode: ipc.ScreenMode = if (payload.len == 1) @enumFromInt(payload[0]) else .active;
+        const mode: ipc.ScreenMode = if (payload.len == 1) @fromBackingInt(@intCast(payload[0])) else .active;
         const all = switch (mode) {
             .active => false,
             .all => true,
@@ -2438,7 +2440,7 @@ const EndingSession = struct {
     }
 
     fn runClient(self: *EndingSession) void {
-        self.client_result = clientLoopOn(self.sock, "", self.daemon.socket_path, self.term_pty[1], self.term_pty[1]);
+        self.client_result = clientLoopOn(.{ .fd = self.sock, .wire = .current }, "", self.daemon.socket_path, self.term_pty[1], self.term_pty[1]);
         self.client_done_ms.store(role.nowMs(), .release);
     }
 
