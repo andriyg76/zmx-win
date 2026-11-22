@@ -1607,6 +1607,12 @@ pub const Daemon = struct {
         try ipc.appendMessage(gpa, &client.write_buf, .Screen, reply.items);
     }
 
+    /// The program the session's shell runs: the session's command, or the shell it started.
+    fn sessionShell(self: *const Daemon) []const u8 {
+        if (self.command) |c| if (c.len > 0) return c[0];
+        return self.shell;
+    }
+
     pub fn handleRun(self: *Daemon, gpa: std.mem.Allocator, io: std.Io, client: *Client, payload: []const u8) !void {
         // Reset task tracking so the new command's exit marker is detected.
         // Without this, a second `zmx run` on the same session is ignored
@@ -1626,18 +1632,15 @@ pub const Daemon = struct {
         // on its line, so the marker goes on the next line instead.
         var buf: [1024]u8 = undefined;
         const marker = try util.getTaskExitMarker(&buf, self.task_id);
-        var single_buf: [1024]u8 = undefined;
-        const single_line_marker = try std.fmt.bufPrint(&single_buf, "; echo {s}$?\r", .{marker});
-        var here_buf: [1024]u8 = undefined;
-        const heredoc_marker = try std.fmt.bufPrint(&here_buf, "\r\necho {s}$?\r", .{marker});
-        const uses_heredoc = std.mem.indexOf(u8, cmd, "<<") != null;
+        var marker_buf: [1024]u8 = undefined;
+        const marker_line = try util.taskMarkerLine(&marker_buf, util.ShellKind.of(self.sessionShell()), marker, cmd);
 
         if (cmd.len > 0 and cmd[cmd.len - 1] == '\r') {
             self.queuePtyInput(gpa, cmd[0 .. cmd.len - 1]);
         } else {
             self.queuePtyInput(gpa, cmd);
         }
-        self.queuePtyInput(gpa, if (uses_heredoc) heredoc_marker else single_line_marker);
+        self.queuePtyInput(gpa, marker_line);
 
         try ipc.appendMessage(gpa, &client.write_buf, .Ack, "");
         client.has_pending_output = true;

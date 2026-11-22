@@ -473,8 +473,67 @@ pub fn generateTaskId(io: std.Io) [4]u8 {
     return std.fmt.bytesToHex(bytes, .lower);
 }
 
+/// The shell whose syntax `zmx run` writes its exit marker in.
+pub const ShellKind = enum {
+    posix,
+    powershell,
+    cmd,
+
+    /// Judged by the program's name: Windows' PowerShell and cmd, and every other shell taken as POSIX.
+    pub fn of(program: []const u8) ShellKind {
+        var base = program;
+        if (std.mem.lastIndexOfAny(u8, base, "/\\")) |i| base = base[i + 1 ..];
+        if (std.ascii.endsWithIgnoreCase(base, ".exe")) base = base[0 .. base.len - 4];
+        if (std.ascii.eqlIgnoreCase(base, "powershell") or std.ascii.eqlIgnoreCase(base, "pwsh")) return .powershell;
+        if (std.ascii.eqlIgnoreCase(base, "cmd")) return .cmd;
+        return .posix;
+    }
+};
+
+/// The input that follows a `zmx run` command so the shell prints `marker` and the command's exit code.
+/// POSIX shells chain it with `;`, or put it on the next line after a heredoc, whose delimiter must end its
+/// line. PowerShell chains it too, reporting $LASTEXITCODE for a failed native program and 1 for a failed
+/// cmdlet, and after a here-string goes to the next line. cmd expands %errorlevel% as it reads a line,
+/// before running it, so its marker always goes on the next line.
+pub fn taskMarkerLine(buf: []u8, kind: ShellKind, marker: []const u8, cmd: []const u8) ![]u8 {
+    return switch (kind) {
+        .posix => if (std.mem.indexOf(u8, cmd, "<<") != null)
+            std.fmt.bufPrint(buf, "\r\necho {s}$?\r", .{marker})
+        else
+            std.fmt.bufPrint(buf, "; echo {s}$?\r", .{marker}),
+        .powershell => {
+            const code = "$(if ($?) { 0 } elseif ($LASTEXITCODE) { $LASTEXITCODE } else { 1 })";
+            const here_string = std.mem.indexOf(u8, cmd, "@'") != null or std.mem.indexOf(u8, cmd, "@\"") != null;
+            return std.fmt.bufPrint(buf, "{s}echo \"{s}{s}\"\r", .{ if (here_string) "\r" else "; ", marker, code });
+        },
+        .cmd => std.fmt.bufPrint(buf, "\recho {s}%errorlevel%\r", .{marker}),
+    };
+}
+
+test "taskMarkerLine follows each shell's syntax" {
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqual(ShellKind.powershell, ShellKind.of("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"));
+    try std.testing.expectEqual(ShellKind.powershell, ShellKind.of("pwsh"));
+    try std.testing.expectEqual(ShellKind.cmd, ShellKind.of("c:\\windows\\system32\\CMD.EXE"));
+    try std.testing.expectEqual(ShellKind.posix, ShellKind.of("/bin/bash"));
+    try std.testing.expectEqualStrings("; echo M$?\r", try taskMarkerLine(&buf, .posix, "M", "ls"));
+    try std.testing.expectEqualStrings("\r\necho M$?\r", try taskMarkerLine(&buf, .posix, "M", "cat <<EOF"));
+    try std.testing.expectEqualStrings("\recho M%errorlevel%\r", try taskMarkerLine(&buf, .cmd, "M", "dir"));
+    try std.testing.expectEqualStrings(
+        "; echo \"M$(if ($?) { 0 } elseif ($LASTEXITCODE) { $LASTEXITCODE } else { 1 })\"\r",
+        try taskMarkerLine(&buf, .powershell, "M", "Get-Item x"),
+    );
+}
+
 pub fn getTaskExitMarker(buf: []u8, id_marker: [4]u8) ![]u8 {
     return std.fmt.bufPrint(buf, "ZMX_TASK_COMPLETED:{s}:", .{id_marker});
+}
+
+test "findTaskExitMarker reads a code a pseudo console ends with an escape, and clamps a Windows one" {
+    const id = [4]u8{ 'a', 'b', 'c', 'd' };
+    try std.testing.expectEqual(@as(?u8, 3), try findTaskExitMarker("ZMX_TASK_COMPLETED:abcd:3\x1b[K\r\n", id));
+    try std.testing.expectEqual(@as(?u8, 255), try findTaskExitMarker("ZMX_TASK_COMPLETED:abcd:-1073741510\r\n", id));
+    try std.testing.expectEqual(@as(?u8, 0), try findTaskExitMarker("echo ZMX_TASK_COMPLETED:abcd:%errorlevel%\r\nZMX_TASK_COMPLETED:abcd:0\r\n", id));
 }
 
 pub fn findTaskExitMarker(output: []const u8, id_marker: [4]u8) !?u8 {
@@ -491,17 +550,18 @@ pub fn findTaskExitMarker(output: []const u8, id_marker: [4]u8) !?u8 {
     while (std.mem.indexOfPos(u8, output, search_start, marker)) |idx| {
         const after_marker = output[idx + marker.len ..];
 
-        // Find the exit code number and newline
+        // Find the exit code number and the newline, or the escape sequence a pseudo console may
+        // write ahead of it
         var end_idx: usize = 0;
-        while (end_idx < after_marker.len and after_marker[end_idx] != '\n' and after_marker[end_idx] != '\r') {
+        while (end_idx < after_marker.len and after_marker[end_idx] != '\n' and after_marker[end_idx] != '\r' and after_marker[end_idx] != 0x1b) {
             end_idx += 1;
         }
 
         const exit_code_str = after_marker[0..end_idx];
 
-        // Parse exit code
-        if (std.fmt.parseInt(u8, exit_code_str, 10)) |exit_code| {
-            return exit_code;
+        // Parse exit code. A Windows exit code can be negative or past 255; it still reports a failure.
+        if (std.fmt.parseInt(i64, exit_code_str, 10)) |exit_code| {
+            return if (exit_code >= 0 and exit_code <= 255) @intCast(exit_code) else 255;
         } else |_| {
             search_start = idx + marker.len;
         }
