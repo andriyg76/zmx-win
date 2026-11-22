@@ -47,6 +47,100 @@ fn onCtrl(event: api.DWORD) callconv(.winapi) api.BOOL {
     return 1;
 }
 
+// ---- stdout bridge ----
+
+// Writes to stdout go into a socket a thread drains to the console, so the loops can poll stdout and stop
+// writing when it falls behind, as a tty lets them on POSIX; a console write itself blocks while the terminal
+// does not read.
+var output_once: api.INIT_ONCE = .{};
+var output_sock: api.SOCKET = api.INVALID_SOCKET;
+/// bytes the loop has handed the bridge, and bytes the thread has written or discarded
+var output_sent = std.atomic.Value(u64).init(0);
+var output_done = std.atomic.Value(u64).init(0);
+/// set by a flush: the thread drops what it reads until it has passed this many bytes
+var output_discard_to = std.atomic.Value(u64).init(0);
+var output_thread: ?api.HANDLE = null;
+
+/// The socket stdout writes into, started on first use.
+pub fn outputSocket() ?api.SOCKET {
+    api.callOnce(&output_once, startOutput);
+    return if (output_sock == api.INVALID_SOCKET) null else output_sock;
+}
+
+fn startOutput() void {
+    const h = api.GetStdHandle(api.STD_OUTPUT_HANDLE) orelse return;
+    const pair = posix.socketPair() catch return;
+    const t = std.Thread.spawn(.{}, pumpOutput, .{ h, pair[1] }) catch {
+        _ = api.closesocket(pair[0]);
+        _ = api.closesocket(pair[1]);
+        return;
+    };
+    output_thread = t.getHandle();
+    t.detach();
+    output_sock = pair[0];
+    _ = atexit(drainOutput);
+}
+
+fn pumpOutput(h: api.HANDLE, in: api.SOCKET) void {
+    var buf: [16384]u8 = undefined;
+    while (true) {
+        const n = api.recv(in, &buf, buf.len, 0);
+        if (n <= 0) return;
+        var rest = buf[0..@intCast(n)];
+        const start = output_done.load(.acquire);
+        const discard_to = output_discard_to.load(.acquire);
+        if (discard_to > start) {
+            const drop = @min(rest.len, discard_to - start);
+            rest = rest[drop..];
+            _ = output_done.fetchAdd(drop, .acq_rel);
+        }
+        while (rest.len > 0) {
+            var wrote: u32 = 0;
+            if (api.WriteFile(h, rest.ptr, @intCast(rest.len), &wrote, null) == 0) {
+                // a flush cancelled the write, or the console is gone: what is left of this read is dropped
+                _ = output_done.fetchAdd(rest.len, .acq_rel);
+                break;
+            }
+            rest = rest[wrote..];
+            _ = output_done.fetchAdd(wrote, .acq_rel);
+        }
+    }
+}
+
+pub fn outputSent(n: usize) void {
+    _ = output_sent.fetchAdd(n, .acq_rel);
+}
+
+/// Bytes written to stdout that the console has not taken yet.
+pub fn outputQueued() usize {
+    const sent = output_sent.load(.acquire);
+    const done = output_done.load(.acquire);
+    return @intCast(sent -| done);
+}
+
+/// Drops what stdout holds that the console has not taken, a write it is blocked in included.
+pub fn flushOutput() void {
+    output_discard_to.store(output_sent.load(.acquire), .release);
+    if (output_thread) |t| _ = CancelSynchronousIo(t);
+}
+extern "kernel32" fn CancelSynchronousIo(thread: api.HANDLE) callconv(.winapi) api.BOOL;
+extern "c" fn atexit(f: *const fn () callconv(.c) void) c_int;
+
+/// At exit, lets the console take what stdout still holds, as a tty keeps what was written to it, while it
+/// keeps taking it: two seconds with no progress give up.
+fn drainOutput() callconv(.c) void {
+    var last = output_done.load(.acquire);
+    var idle_since = api.GetTickCount64();
+    while (outputQueued() > 0) {
+        api.Sleep(5);
+        const now_done = output_done.load(.acquire);
+        if (now_done != last) {
+            last = now_done;
+            idle_since = api.GetTickCount64();
+        } else if (api.GetTickCount64() - idle_since > 2000) return;
+    }
+}
+
 // ---- stdin bridge ----
 
 var input_once: api.INIT_ONCE = .{};

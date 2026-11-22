@@ -149,6 +149,7 @@ fn sockOf(fd: fd_t) ?api.SOCKET {
     return switch (e.kind) {
         .socket => e.sock,
         .stdin => stdio.inputSocket(),
+        .stdout => stdio.outputSocket(),
         else => null,
     };
 }
@@ -463,7 +464,16 @@ pub fn write(fd: fd_t, bytes: []const u8) WriteError!usize {
                 else => error.Unexpected,
             };
         },
-        .stdout, .stderr, .file => {
+        .stdout => if (stdio.outputSocket()) |sock| {
+            setNonblock(sock, e.nonblock) catch {};
+            const n = api.send(sock, bytes.ptr, @intCast(len), 0);
+            if (n >= 0) {
+                stdio.outputSent(@intCast(n));
+                return @intCast(n);
+            }
+            return if (api.WSAGetLastError() == api.WSAEWOULDBLOCK) error.WouldBlock else error.BrokenPipe;
+        } else return writeHandle(api.GetStdHandle(api.STD_OUTPUT_HANDLE), bytes[0..len]),
+        .stderr, .file => {
             const h = switch (e.kind) {
                 .stdout => api.GetStdHandle(api.STD_OUTPUT_HANDLE),
                 .stderr => api.GetStdHandle(api.STD_ERROR_HANDLE),
@@ -477,6 +487,15 @@ pub fn write(fd: fd_t, bytes: []const u8) WriteError!usize {
         },
         else => return error.NotOpenForWriting,
     }
+}
+
+fn writeHandle(handle: ?api.HANDLE, bytes: []const u8) WriteError!usize {
+    const h = handle orelse return error.NotOpenForWriting;
+    var written: u32 = 0;
+    if (api.WriteFile(h, bytes.ptr, @intCast(bytes.len), &written, null) == 0) {
+        return if (api.GetLastError() == api.ERROR_BROKEN_PIPE) error.BrokenPipe else error.InputOutput;
+    }
+    return written;
 }
 
 pub const ReadError = error{
@@ -645,8 +664,8 @@ pub fn pollOrInterrupted(fds: []pollfd, timeout: i32) PollError!usize {
     return poll(fds, timeout);
 }
 
-/// WSAPoll over the descriptors' sockets. A stdout or file descriptor is always writable, since its writes
-/// block, and polling one ends the wait at once.
+/// WSAPoll over the descriptors' sockets, stdin's and stdout's bridges included. A stderr or file descriptor
+/// is always writable, since its writes block, and polling one ends the wait at once.
 pub fn poll(fds: []pollfd, timeout: i32) PollError!usize {
     var wfds_buf: [256]api.WSAPOLLFD = undefined;
     if (fds.len > wfds_buf.len) return error.SystemResources;
@@ -663,7 +682,7 @@ pub fn poll(fds: []pollfd, timeout: i32) PollError!usize {
             continue;
         };
         switch (e.kind) {
-            .stdout, .stderr, .file => {
+            .stderr, .file => {
                 p.revents = p.events & POLL.OUT;
                 if (p.revents != 0) ready += 1;
             },

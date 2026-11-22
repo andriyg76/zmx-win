@@ -43,9 +43,9 @@ fn ioctl(fd: c_int, request: c_ulong, arg: ?*anyopaque) callconv(.c) c_int {
             return if (conpty.resize(fd, ws.ws_row, ws.ws_col)) 0 else -1;
         },
         cross.TIOCOUTQ => {
-            // console writes complete before returning, so nothing is ever queued
+            // what stdout's bridge holds that the console has not taken; other writes complete before returning
             const q: *c_int = @ptrCast(@alignCast(arg orelse return -1));
-            q.* = 0;
+            q.* = if (stdHandleOf(fd) == api.STD_OUTPUT_HANDLE) @intCast(@min(stdio.outputQueued(), std.math.maxInt(c_int))) else 0;
             return 0;
         },
         cross.FIONREAD => {
@@ -82,7 +82,9 @@ fn tcsetattr(fd: c_int, action: c_int, t: *const cross.struct_termios) callconv(
 }
 
 fn tcflush(fd: c_int, queue: c_int) callconv(.c) c_int {
-    if (queue != cross.TCOFLUSH and stdHandleOf(fd) == api.STD_INPUT_HANDLE) stdio.flushInput();
+    const which = stdHandleOf(fd);
+    if (queue != cross.TCOFLUSH and which == api.STD_INPUT_HANDLE) stdio.flushInput();
+    if (queue != cross.TCIFLUSH and which == api.STD_OUTPUT_HANDLE) stdio.flushOutput();
     return 0;
 }
 
