@@ -14,6 +14,7 @@ const label = @import("label.zig");
 const lib_posix = @import("posix.zig");
 const cross = @import("cross");
 const signal = @import("signal.zig");
+const role = @import("role.zig");
 const loop = @import("loop.zig");
 const Daemon = if (has_daemon) loop.Daemon else struct {};
 
@@ -166,12 +167,18 @@ pub fn attach(alloc: Allocator, io: Io, name: []const u8, opts: AttachOptions) !
     var orig_termios: cross.termios = undefined;
     const stdin_is_tty = cross.tcgetattr(lib_posix.STDIN_FILENO, &orig_termios) == 0;
     const restore_seq = "\x1bc\x1b]110\x1b\\\x1b]111\x1b\\\x1b]112\x1b\\";
+    // A managed terminal keeps the session's last screen up after the client
+    // exits, which RIS would erase. Turn off the input reports a program may
+    // have left on and leave the screen alone.
+    const managed_exit_seq = "\x1b[0m\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1004l\x1b[?2004l" ++
+        "\x1b[?2031l\x1b[?2048l\x1b]110\x1b\\\x1b]111\x1b\\\x1b]112\x1b\\";
+    const exit_seq = if (role.nonceFromEnv() != null) managed_exit_seq else restore_seq;
 
     defer {
         if (stdin_is_tty) {
             _ = cross.tcsetattr(lib_posix.STDIN_FILENO, cross.TCSAFLUSH, &orig_termios);
         }
-        _ = lib_posix.write(lib_posix.STDOUT_FILENO, restore_seq) catch {};
+        _ = lib_posix.write(lib_posix.STDOUT_FILENO, exit_seq) catch {};
     }
 
     if (stdin_is_tty) {
