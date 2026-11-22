@@ -1248,6 +1248,21 @@ pub const PollError = error{
     SystemResources,
 } || UnexpectedError;
 
+/// As poll, but a signal ends the wait with 0 instead of restarting it with the same timeout, for a caller that
+/// recomputes the timeout from a deadline.
+pub fn pollOrInterrupted(fds: []pollfd, timeout: i32) PollError!usize {
+    const fds_count = cast(nfds_t, fds.len) orelse return error.SystemResources;
+    const rc = system.poll(fds.ptr, fds_count, timeout);
+    return switch (errno(rc)) {
+        .SUCCESS => @intCast(rc),
+        .FAULT => unreachable,
+        .INTR => 0,
+        .INVAL => unreachable,
+        .NOMEM => error.SystemResources,
+        else => |err| unexpectedErrno(err),
+    };
+}
+
 pub fn poll(fds: []pollfd, timeout: i32) PollError!usize {
     while (true) {
         const fds_count = cast(nfds_t, fds.len) orelse return error.SystemResources;
