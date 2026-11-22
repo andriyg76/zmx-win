@@ -841,7 +841,6 @@ pub const Daemon = struct {
         }
         self.labels.deinit(gpa);
         self.pty_write_buf.deinit(gpa);
-        gpa.free(self.socket_path);
     }
 
     pub fn shutdown(self: *Daemon, gpa: std.mem.Allocator) void {
@@ -1773,6 +1772,16 @@ pub const Daemon = struct {
     }
 };
 
+test "daemon deinit leaves the caller-owned socket path intact" {
+    var cfg = Cfg{ .socket_dir = "", .log_dir = "" };
+    var socket_path = "/tmp/zmx-test/socket".*;
+    var daemon = Daemon.init(std.testing.io, &cfg, "test", &socket_path);
+
+    daemon.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("/tmp/zmx-test/socket", &socket_path);
+}
+
 test "terminal retains the configured scrollback without the default byte cap" {
     const alloc = std.testing.allocator;
     const cfg = Cfg{ .socket_dir = "", .log_dir = "" };
@@ -2525,6 +2534,7 @@ const EndingSession = struct {
         }
         lib_posix.close(self.server_fd);
         self.daemon.deinit(self.alloc);
+        self.alloc.free(self.daemon.socket_path);
         self.tmp.cleanup();
     }
 };
