@@ -326,15 +326,34 @@ fn sleepMs(ms: u64) void {
     _ = std.c.nanosleep(&ts, null);
 }
 
+pub const TerminalExit = union(enum) {
+    detached,
+    ended: i64,
+    interrupted,
+};
+
 /// How an attach client leaves its terminal `t`: after a detach (no deadline) as upstream does. After a
 /// session end the terminal gets until the reset's share of the deadline to take the output and the reset
 /// the rest; what it has not taken by then is flushed, since TCSAFLUSH and, on macOS, the exit's close of
 /// the tty wait for it. `t` restores termios with TCSAFLUSH when the output was taken.
-pub fn leaveTerminal(t: anytype, deadline_ms: ?i64) void {
-    const d = deadline_ms orelse {
-        t.restoreTermios(true);
-        t.writeReset(null);
-        return;
+pub fn leaveTerminal(t: anytype, exit: TerminalExit) void {
+    const d = switch (exit) {
+        .detached => {
+            t.restoreTermios(true);
+            t.writeReset(null);
+            return;
+        },
+        .interrupted => {
+            // A supervisor can signal an attach client and stop reading its PTY.
+            // TCSAFLUSH would wait for the supervisor while it waits for us.
+            const deadline = role.nowMs() + 100;
+            t.flushOutput();
+            t.restoreTermios(false);
+            t.writeReset(deadline);
+            if (!t.outputTakenBy(deadline)) t.flushOutput();
+            return;
+        },
+        .ended => |deadline| deadline,
     };
     const taken = t.outputTakenBy(d - resetShare(t.out_fd));
     if (!taken) t.flushOutput();
@@ -2772,21 +2791,35 @@ test "leaving a terminal: a detach as upstream, a session end within the deadlin
     const C = TerminalLog.Call;
 
     var detach: TerminalLog = .{ .out_fd = pty[1], .takes = true };
-    leaveTerminal(&detach, null);
+    leaveTerminal(&detach, .detached);
     try std.testing.expectEqualDeep(&[_]C{ .{ .restore_flushing = true }, .{ .reset = null } }, detach.calls[0..detach.n]);
 
     var taken: TerminalLog = .{ .out_fd = pty[1], .takes = true };
-    leaveTerminal(&taken, d);
+    leaveTerminal(&taken, .{ .ended = d });
     try std.testing.expectEqualDeep(&[_]C{ .{ .taken_by = d - RESET_SHARE_MS }, .{ .restore_flushing = true }, .{ .reset = d }, .{ .taken_by = d } }, taken.calls[0..taken.n]);
 
     var unread: TerminalLog = .{ .out_fd = pty[1], .takes = false };
-    leaveTerminal(&unread, d);
+    leaveTerminal(&unread, .{ .ended = d });
     try std.testing.expectEqualDeep(&[_]C{ .{ .taken_by = d - RESET_SHARE_MS }, .flush, .{ .restore_flushing = false }, .{ .reset = d }, .{ .taken_by = d }, .flush }, unread.calls[0..unread.n]);
 
     // a stdout that is no terminal needs no share for a reset
     var file: TerminalLog = .{ .out_fd = pipe[1], .takes = true };
-    leaveTerminal(&file, d);
+    leaveTerminal(&file, .{ .ended = d });
     try std.testing.expectEqual(C{ .taken_by = d }, file.calls[0]);
+}
+
+test "a signalled attach restores termios without waiting on unread output" {
+    const pipe = try lib_posix.pipe2(.{});
+    defer for (pipe) |fd| lib_posix.close(fd);
+    var t: TerminalLog = .{ .out_fd = pipe[1], .takes = false };
+    leaveTerminal(&t, .interrupted);
+
+    try std.testing.expectEqual(@as(usize, 5), t.n);
+    try std.testing.expectEqual(TerminalLog.Call.flush, t.calls[0]);
+    try std.testing.expectEqualDeep(TerminalLog.Call{ .restore_flushing = false }, t.calls[1]);
+    const deadline = t.calls[2].reset orelse return error.UnboundedReset;
+    try std.testing.expectEqualDeep(TerminalLog.Call{ .taken_by = deadline }, t.calls[3]);
+    try std.testing.expectEqual(TerminalLog.Call.flush, t.calls[4]);
 }
 
 fn signalFor(thread: std.c.pthread_t, ms: i64) void {
@@ -2845,7 +2878,7 @@ test "a pty nobody reads holds its output queue until the deadline, and a flush 
     try std.testing.expectEqual(@as(c_int, 0), cross.tcflush(pty[1], cross.TCOFLUSH));
     try std.testing.expect(takenBy(pty[1], role.nowMs(), ttyOutputQueued));
     while (true) _ = lib_posix.write(pty[1], "x") catch break;
-    leaveTerminal(Tty{ .out_fd = pty[1], .in_fd = null, .orig = undefined, .reset = "\x1bc" }, role.nowMs() + 400);
+    leaveTerminal(Tty{ .out_fd = pty[1], .in_fd = null, .orig = undefined, .reset = "\x1bc" }, .{ .ended = role.nowMs() + 400 });
     try std.testing.expect(takenBy(pty[1], role.nowMs(), ttyOutputQueued));
 }
 
@@ -2864,7 +2897,7 @@ test "a session end's reset reaches a pty that is read" {
     var got: [256]u8 = undefined;
     var len: usize = 0;
     const reader = try std.Thread.spawn(.{}, readFor, .{ pty[0], 1000, &got, &len });
-    leaveTerminal(Tty{ .out_fd = pty[1], .in_fd = null, .orig = undefined, .reset = "\x1bc" }, role.nowMs() + 500);
+    leaveTerminal(Tty{ .out_fd = pty[1], .in_fd = null, .orig = undefined, .reset = "\x1bc" }, .{ .ended = role.nowMs() + 500 });
     reader.join();
     try std.testing.expectEqualStrings("\x1bc", got[0..len]);
 }

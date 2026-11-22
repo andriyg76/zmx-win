@@ -122,11 +122,11 @@ pub fn connect(alloc: Allocator, io: Io, name: []const u8) !i32 {
 
 /// Attach the current process's stdin/stdout TTY to a session (creating if needed).
 pub fn attach(alloc: Allocator, io: Io, name: []const u8, opts: AttachOptions) !void {
-    var close_deadline: ?i64 = null;
-    return attachInner(alloc, io, name, opts, &close_deadline);
+    var exit: loop.TerminalExit = .detached;
+    return attachInner(alloc, io, name, opts, &exit);
 }
 
-fn attachInner(alloc: Allocator, io: Io, name: []const u8, opts: AttachOptions, close_deadline: *?i64) !void {
+fn attachInner(alloc: Allocator, io: Io, name: []const u8, opts: AttachOptions, exit: *loop.TerminalExit) !void {
     signal.ignoreSigpipe();
     const cur_sesh = socket.getSeshNameFromEnv();
     if (cur_sesh.len > 0) {
@@ -184,7 +184,7 @@ fn attachInner(alloc: Allocator, io: Io, name: []const u8, opts: AttachOptions, 
         .in_fd = if (stdin_is_tty) lib_posix.STDIN_FILENO else null,
         .orig = &orig_termios,
         .reset = exit_seq,
-    }, close_deadline.*);
+    }, exit.*);
 
     if (stdin_is_tty) {
         var raw_termios = orig_termios;
@@ -200,8 +200,14 @@ fn attachInner(alloc: Allocator, io: Io, name: []const u8, opts: AttachOptions, 
     _ = try lib_posix.write(lib_posix.STDOUT_FILENO, clear_seq);
 
     const env_str = opts.tracked_env orelse "";
-    const looper = try loop.clientLoop(connection, env_str, socket_path);
-    close_deadline.* = looper.close_deadline_ms;
+    const looper = loop.clientLoop(connection, env_str, socket_path) catch |err| {
+        switch (err) {
+            error.Sighup, error.Sigint, error.Sigterm => exit.* = .interrupted,
+            else => {},
+        }
+        return err;
+    };
+    if (looper.close_deadline_ms) |deadline| exit.* = .{ .ended = deadline };
     switch (looper.kind) {
         .detach => return,
         .switch_session => {
@@ -209,7 +215,7 @@ fn attachInner(alloc: Allocator, io: Io, name: []const u8, opts: AttachOptions, 
                 _ = lib_posix.write(lib_posix.STDOUT_FILENO, restore_seq) catch {};
                 var new_opts = opts;
                 if (looper.cwd) |new_cwd| new_opts.cwd = new_cwd;
-                return attachInner(alloc, io, target_name, new_opts, close_deadline);
+                return attachInner(alloc, io, target_name, new_opts, exit);
             }
         },
     }
