@@ -206,21 +206,21 @@ pub fn toOsc7Cwd(buf: []u8, path: []const u8, hostname: []const u8) ?[]const u8 
 
 const is_windows = @import("builtin").os.tag == .windows;
 
-/// `C:\dir` as a URI path, `/C:/dir`; a path with no drive letter only has its separators turned.
+/// `C:\dir` as a URI path, `/C:/dir`. Any other path, such as a POSIX one a session reports from a host it
+/// reached over ssh, stays as it is.
 fn windowsPathToUri(buf: []u8, path: []const u8) ?[]const u8 {
-    const drive = path.len >= 2 and std.ascii.isAlphabetic(path[0]) and path[1] == ':';
-    const len = path.len + @intFromBool(drive);
-    if (len > buf.len) return null;
-    if (drive) buf[0] = '/';
-    @memcpy(buf[@intFromBool(drive)..len], path);
-    std.mem.replaceScalar(u8, buf[0..len], '\\', '/');
-    return buf[0..len];
+    if (!(path.len >= 2 and std.ascii.isAlphabetic(path[0]) and path[1] == ':')) return path;
+    if (path.len + 1 > buf.len) return null;
+    buf[0] = '/';
+    @memcpy(buf[1 .. path.len + 1], path);
+    std.mem.replaceScalar(u8, buf[0 .. path.len + 1], '\\', '/');
+    return buf[0 .. path.len + 1];
 }
 
-/// A URI path back as a Windows one, in place: `/C:/dir` becomes `C:\dir`.
+/// A URI path back as a Windows one, in place: `/C:/dir` becomes `C:\dir`. Any other path stays as it is.
 fn windowsPathFromUri(path: []u8) []u8 {
-    var p = path;
-    if (p.len >= 3 and p[0] == '/' and std.ascii.isAlphabetic(p[1]) and p[2] == ':') p = p[1..];
+    if (!(path.len >= 3 and path[0] == '/' and std.ascii.isAlphabetic(path[1]) and path[2] == ':')) return path;
+    const p = path[1..];
     std.mem.replaceScalar(u8, p, '/', '\\');
     return p;
 }
@@ -232,6 +232,9 @@ test "a Windows cwd round-trips through the URI form Windows terminals use" {
     var back: [32]u8 = undefined;
     @memcpy(back[0..uri.len], uri);
     try std.testing.expectEqualStrings("C:\\Users\\andri", windowsPathFromUri(back[0..uri.len]));
+    try std.testing.expectEqualStrings("/home/andri", windowsPathToUri(&buf, "/home/andri").?);
+    var posix = "/home/andri".*;
+    try std.testing.expectEqualStrings("/home/andri", windowsPathFromUri(&posix));
     if (!is_windows) return;
     var out: [256]u8 = undefined;
     const osc7 = toOsc7Cwd(&out, "C:\\Users\\andri\\My Dir", "valge-cast") orelse return error.TooLong;
