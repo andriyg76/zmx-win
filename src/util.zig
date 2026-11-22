@@ -739,6 +739,75 @@ fn parseDecimal(buf: []const u8, pos: *usize) ?u32 {
     return value;
 }
 
+/// Detect input a person at the leading terminal produced: a key, Esc and control keys included, a paste,
+/// or a mouse press or wheel step. A terminal's replies (device attributes, mode and cursor reports, focus,
+/// OSC and DCS answers, the kitty keyboard flags) and mouse motion or release are not. A sequence cut off
+/// at the end of the read counts, so an unreadable tail never hands the lead away.
+pub fn isLeaderUse(payload: []const u8) bool {
+    var i: usize = 0;
+    while (i < payload.len) {
+        if (payload[i] != 0x1b or i + 1 == payload.len) return true;
+        switch (payload[i + 1]) {
+            '[' => {
+                if (parseKittyCsiU(payload[i + 2 ..])) |kitty| {
+                    if (kitty.event_type != 3) return true;
+                    i += 2 + kitty.consumed;
+                    continue;
+                }
+                const used = csiUse(payload[i + 2 ..]) orelse return true;
+                if (used.use) return true;
+                i += 2 + used.consumed;
+            },
+            ']', 'P', '_', '^', 'X' => {
+                // a kitty paste event (mode 5522) arrives as an OSC, not as the pasted text
+                if (std.mem.startsWith(u8, payload[i + 1 ..], "]5522;")) return true;
+                i = stringEnd(payload, i + 2) orelse return true;
+            },
+            else => return true, // SS3 keys, Alt-modified keys, Esc pressed twice
+        }
+    }
+    return false;
+}
+
+const CsiUse = struct { use: bool, consumed: usize };
+
+/// csiUse reads one CSI body, the bytes after `ESC [`; null when it is cut off.
+fn csiUse(buf: []const u8) ?CsiUse {
+    if (buf.len > 0 and buf[0] == 'M') {
+        if (buf.len < 4) return null;
+        const cb = buf[1] -% 32;
+        return .{ .use = cb & 32 == 0 and cb & 3 != 3, .consumed = 4 };
+    }
+    var end: usize = 0;
+    var intermediate = false;
+    while (end < buf.len and buf[end] >= 0x20 and buf[end] <= 0x3f) : (end += 1) {
+        if (buf[end] <= 0x2f) intermediate = true;
+    }
+    if (end == buf.len or buf[end] < 0x40 or buf[end] > 0x7e) return null;
+    const final = buf[end];
+    const consumed = end + 1;
+    if (end > 0 and buf[0] == '<') {
+        var pos: usize = 1;
+        const button = parseDecimal(buf, &pos) orelse 32;
+        return .{ .use = final == 'M' and button & 32 == 0, .consumed = consumed };
+    }
+    // a private marker or an intermediate byte only appears in replies; a bare R is a cursor report
+    if (intermediate or (end > 0 and buf[0] >= 0x3c)) return .{ .use = false, .consumed = consumed };
+    // u is a kitty key with no modifier field, a release always carrying one
+    const key = std.mem.indexOfScalar(u8, "ABCDEFHPQSZu~", final) != null;
+    return .{ .use = key, .consumed = consumed };
+}
+
+/// stringEnd answers the index after the BEL or ST closing a string sequence that starts at `from`.
+fn stringEnd(payload: []const u8, from: usize) ?usize {
+    var i = from;
+    while (i < payload.len) : (i += 1) {
+        if (payload[i] == 0x07) return i + 1;
+        if (payload[i] == 0x1b and i + 1 < payload.len and payload[i + 1] == '\\') return i + 2;
+    }
+    return null;
+}
+
 pub const HistoryFormat = enum(u8) {
     plain = 0,
     vt = 1,
@@ -1437,4 +1506,30 @@ test "stripAnsi: UTF-8 bytes do not start escape sequences" {
     const result = try stripAnsi(alloc, "Ýmir\nline two\n");
     defer alloc.free(result);
     try testing.expectEqualStrings("Ýmir\nline two\n", result);
+}
+
+test "isLeaderUse: keys, paste and presses, never a terminal's replies, motion or release" {
+    const used = [_][]const u8{
+        "a",              "\x03",                "\x04",          "\x7f",            "\x1b",
+        "\x1bx",          "\x1b\x1b",            "\x1b[A",        "\x1bOA",          "\x1b[H",
+        "\x1b[F",         "\x1b[Z",              "\x1b[3~",       "\x1b[1;5P",       "\x1b[99;5u",
+        "\x1b[200~x",     "\x1b[<0;10;5M",       "\x1b[<64;1;1M", "\x1b[M !!",       "\x1b[I\x03",
+        "\x1b[?1u\x1b[A", "\x1b]11;rgb:0/0/0\x07q", "\x1b[12",       "\x1b[102;1:1u",   "\x1b[27u",
+        "\x1b[97u",       "\x1b[13u",             "\x1b]",          "\x1bP",           "\x1b]5522;type=read:status=OK\x1b\\",
+    };
+    for (used) |input| {
+        if (!isLeaderUse(input)) std.debug.print("not counted as use: {any}\n", .{input});
+        try testing.expect(isLeaderUse(input));
+    }
+    const replies = [_][]const u8{
+        "",                     "\x1b[?62;22c",         "\x1b[>1;10;0c",          "\x1b[12;40R",
+        "\x1b[0n",              "\x1b[?1u",             "\x1b[?2004;2$y",         "\x1b[I",
+        "\x1b[O",               "\x1b[8;24;80t",        "\x1b]11;rgb:0/0/0\x07",  "\x1b]10;rgb:f/f/f\x1b\\",
+        "\x1bP>|ghostty\x1b\\", "\x1b[<0;10;5m",        "\x1b[<35;10;5M",         "\x1b[MC!!",
+        "\x1b[M#!!",            "\x1b[102;1:3u",        "\x1b[?997;1n",
+    };
+    for (replies) |input| {
+        if (isLeaderUse(input)) std.debug.print("counted as use: {any}\n", .{input});
+        try testing.expect(!isLeaderUse(input));
+    }
 }

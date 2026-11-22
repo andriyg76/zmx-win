@@ -43,6 +43,9 @@ pub const Tag = enum(u8) {
     /// session's keyboard mode and queued without taking the lead.
     /// reply: one `TypeResult` byte. Accepted means queued, not executed.
     Type = 25,
+    /// client -> daemon, after Manage: the client's ZMX_MANAGED token, then, when it takes back a lead
+    /// it lost with its link, a newline and the token of the attach that held it.
+    Identity = 27,
     Unsupported = 255,
     // Non-exhaustive: this enum comes off the wire via bytesToValue and
     // @enumFromInt, so out-of-range values are representable
@@ -415,7 +418,7 @@ test "Tag wire values are frozen" {
         .{ Tag.Send, 18 },     .{ Tag.EnvGet, 19 },       .{ Tag.EnvSet, 20 },
         .{ Tag.EnvData, 21 },  .{ Tag.Capture, 22 },      .{ Tag.Unsupported, 255 },
         .{ Tag.Role, 23 },     .{ Tag.Screen, 24 },       .{ Tag.Type, 25 },
-        .{ Tag.Manage, 26 },
+        .{ Tag.Manage, 26 },   .{ Tag.Identity, 27 },
     }) |p| try std.testing.expectEqual(@as(u8, p[1]), @backingInt(p[0]));
 }
 

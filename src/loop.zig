@@ -83,9 +83,12 @@ fn clientLoopOn(client_sock_fd: i32, env_str: []const u8, session_path: []const 
 
     var relay: ?role.Relay = if (role.nonceFromEnv()) |nonce| role.Relay.init(nonce) else null;
     defer if (relay) |*r| r.deinit();
-    if (relay != null) {
+    if (relay) |r| {
         const flags = ipc.ManageFlags{ .claim = role.claimFromEnv() };
         try ipc.appendMessage(gpa, &sock_write_buf, .Manage, std.mem.asBytes(&flags));
+        // an older daemon ignores the tag, so a reclaim there leaves the lead where it is
+        var id_buf: role.IdentityBuf = undefined;
+        try ipc.appendMessage(gpa, &sock_write_buf, .Identity, role.identity(&id_buf, r.nonce, role.reclaimFromEnv()));
     }
 
     // Send init message with terminal size (buffered)
@@ -667,6 +670,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                         .Capture => try daemon.handleCapture(gpa, client, &term, msg.payload),
                         .Run => try daemon.handleRun(gpa, io, client, msg.payload),
                         .Manage => daemon.handleManage(client, msg.payload),
+                        .Identity => try daemon.handleIdentity(gpa, client, msg.payload),
                         .Type => try daemon.handleType(gpa, client, &term, msg.payload),
                         .Screen => try daemon.handleScreen(gpa, client, &term, msg.payload),
                         .Ack, .TaskComplete, .LabelData, .EnvData, .Role, .Unsupported => {},
@@ -738,6 +742,10 @@ pub const Client = struct {
     /// sent .Manage: leads only by claiming, never by typing, and is told its role
     managed: bool = false,
     claim_on_init: bool = false,
+    /// the client's ZMX_MANAGED token, from Identity
+    token: ?[]u8 = null,
+    /// the token of an earlier attach whose lead this client takes back, from Identity
+    reclaim_from: ?[]u8 = null,
     told_role: ?ipc.Role = null,
     read_buf: ipc.SocketBuffer,
     write_buf: std.ArrayList(u8),
@@ -748,6 +756,8 @@ pub const Client = struct {
         self.read_buf.deinit();
         self.write_buf.deinit(self.alloc);
         if (self.env_str) |s| gpa.free(s);
+        if (self.token) |s| gpa.free(s);
+        if (self.reclaim_from) |s| gpa.free(s);
     }
 
     fn setEnv(self: *Client, gpa: std.mem.Allocator, env_str: []const u8) !void {
@@ -777,6 +787,9 @@ pub const Daemon = struct {
     leader_client_fd: ?i32 = null,
     /// bumped on every leadership change, carried in each RoleChange
     leader_generation: u32 = 0,
+    /// the leader took a vacant session without claiming and has not typed, pasted or clicked since,
+    /// so a client taking back a lead it lost with its link may have it
+    leader_idle: bool = false,
     /// bumped on every pty read, resize and injected output, carried in each ScreenHeader
     screen_revision: u64 = 0,
     running: bool = true,
@@ -1064,6 +1077,7 @@ pub const Daemon = struct {
     fn setLeader(self: *Daemon, gpa: std.mem.Allocator, client: *Client) !void {
         std.log.info("setting new leader client_fd={d}", .{client.socket_fd});
         self.leader_client_fd = client.socket_fd;
+        self.leader_idle = false;
         self.leader_generation +%= 1;
         // Send a resize message to the client so it can send us back their window size
         // so we can resize the pty and ghostty state.
@@ -1103,6 +1117,31 @@ pub const Daemon = struct {
         const flags = std.mem.bytesToValue(ipc.ManageFlags, payload);
         client.managed = true;
         client.claim_on_init = flags.claim;
+    }
+
+    pub fn handleIdentity(self: *Daemon, gpa: std.mem.Allocator, client: *Client, payload: []const u8) !void {
+        _ = self;
+        if (!client.managed) return;
+        var parts = std.mem.splitScalar(u8, payload, '\n');
+        const token = parts.first();
+        if (!role.isNonce(token)) return;
+        const from = parts.next();
+        if (from != null and !role.isNonce(from.?)) return;
+        if (client.token) |s| gpa.free(s);
+        if (client.reclaim_from) |s| gpa.free(s);
+        client.reclaim_from = null;
+        client.token = try gpa.dupe(u8, token);
+        if (from) |f| client.reclaim_from = try gpa.dupe(u8, f);
+    }
+
+    /// Whether `client`, taking back a lead it lost with its link, may have it now: its own earlier
+    /// attach still leads, or the leader only filled the vacancy and has not been used since.
+    fn yieldsTo(self: *Daemon, client: *const Client) bool {
+        const from = client.reclaim_from orelse return false;
+        const leader = self.getLeaderClient() orelse return false;
+        if (self.leader_idle) return true;
+        const token = leader.token orelse return false;
+        return std.mem.eql(u8, token, from);
     }
 
     /// Queue automation bytes without touching leadership, and say whether they were queued.
@@ -1195,6 +1234,7 @@ pub const Daemon = struct {
 
         // client is leader, send entire payload (ansi escape codes + text)
         if (self.leader_client_fd == client.socket_fd) {
+            if (self.leader_idle and util.isLeaderUse(payload)) self.leader_idle = false;
             self.queuePtyInput(gpa, payload);
             return;
         }
@@ -1271,8 +1311,10 @@ pub const Daemon = struct {
         }
         client.is_terminal = true;
 
-        if (self.leader_client_fd == null or client.claim_on_init) {
+        const vacant = self.leader_client_fd == null;
+        if (vacant or client.claim_on_init or self.yieldsTo(client)) {
             try self.setLeader(gpa, client);
+            self.leader_idle = vacant and !client.claim_on_init and client.reclaim_from == null;
         }
         // ahead of the snapshot below, so a managed client learns its role before any output
         self.notifyRoles(gpa);
@@ -1972,6 +2014,100 @@ test "a claiming attach takes the lead from a live leader and both are told" {
 
     _ = daemon.closeClient(alloc, viewer, 1, false);
     _ = daemon.closeClient(alloc, origin, 0, false);
+}
+
+fn testIdentified(alloc: std.mem.Allocator, daemon: *Daemon, fd: i32, claim: bool, identity: []const u8) !*Client {
+    const client = try testManaged(alloc, daemon, fd, claim);
+    try daemon.handleIdentity(alloc, client, identity);
+    return client;
+}
+
+test "a reconnect takes back a lead its own dropped attach still holds, and no other" {
+    const alloc = std.testing.allocator;
+    const cfg = Cfg{ .socket_dir = "", .log_dir = "" };
+    var term = try initTerminal(alloc, std.testing.io, .{ .cols = 80, .rows = 24 }, &cfg);
+    defer term.deinit(alloc);
+    var daemon = testDaemon();
+    defer daemon.clients.deinit(alloc);
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    const a = try lib_posix.pipe2(.{});
+    const b = try lib_posix.pipe2(.{});
+    const c = try lib_posix.pipe2(.{});
+    defer lib_posix.close(c[1]);
+    const pty = c[0];
+    defer lib_posix.close(pty);
+    const size = std.mem.asBytes(&ipc.Resize{ .rows = 30, .cols = 100 });
+
+    const origin = try testIdentified(alloc, &daemon, a[0], false, "o1");
+    try daemon.handleInit(alloc, origin, pty, &term, size);
+    const dropped = try testIdentified(alloc, &daemon, a[1], true, "v1");
+    try daemon.handleInit(alloc, dropped, pty, &term, size);
+    try std.testing.expectEqual(@as(?i32, a[1]), daemon.leader_client_fd);
+
+    // naming another attach's token takes nothing from a leader that claimed
+    const stranger = try testIdentified(alloc, &daemon, b[0], false, "v3\nv9");
+    try daemon.handleInit(alloc, stranger, pty, &term, size);
+    try std.testing.expectEqual(@as(?i32, a[1]), daemon.leader_client_fd);
+    try std.testing.expectEqual(ipc.Role.follower, queuedRoles(stranger).last.?.role);
+
+    const back = try testIdentified(alloc, &daemon, b[1], false, "v2\nv1");
+    try daemon.handleInit(alloc, back, pty, &term, size);
+    try std.testing.expectEqual(@as(?i32, b[1]), daemon.leader_client_fd);
+    try std.testing.expectEqual(ipc.Role.leader, queuedRoles(back).last.?.role);
+    try std.testing.expectEqual(ipc.Role.follower, queuedRoles(origin).last.?.role);
+
+    _ = daemon.closeClient(alloc, back, 3, false);
+    _ = daemon.closeClient(alloc, stranger, 2, false);
+    _ = daemon.closeClient(alloc, dropped, 1, false);
+    _ = daemon.closeClient(alloc, origin, 0, false);
+}
+
+test "a reconnect takes back a lead a vacant attach filled until that attach is used" {
+    const alloc = std.testing.allocator;
+    const cfg = Cfg{ .socket_dir = "", .log_dir = "" };
+    var term = try initTerminal(alloc, std.testing.io, .{ .cols = 80, .rows = 24 }, &cfg);
+    defer term.deinit(alloc);
+    var daemon = testDaemon();
+    defer daemon.clients.deinit(alloc);
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    const a = try lib_posix.pipe2(.{});
+    const b = try lib_posix.pipe2(.{});
+    const c = try lib_posix.pipe2(.{});
+    defer lib_posix.close(c[1]);
+    const pty = c[0];
+    defer lib_posix.close(pty);
+    const size = std.mem.asBytes(&ipc.Resize{ .rows = 30, .cols = 100 });
+
+    // the origin re-attached without a claim after the viewer's attach went away
+    const fallback = try testIdentified(alloc, &daemon, a[0], false, "o2");
+    try daemon.handleInit(alloc, fallback, pty, &term, size);
+    try std.testing.expect(daemon.leader_idle);
+
+    // focus reports, motion and a terminal's answers leave it idle
+    try daemon.handleInput(alloc, fallback, "\x1b[I\x1b[<35;4;4M\x1b[12;1R");
+    try std.testing.expect(daemon.leader_idle);
+
+    const back = try testIdentified(alloc, &daemon, a[1], false, "v2\nv1");
+    try daemon.handleInit(alloc, back, pty, &term, size);
+    try std.testing.expectEqual(@as(?i32, a[1]), daemon.leader_client_fd);
+    try std.testing.expect(!daemon.leader_idle);
+    _ = daemon.closeClient(alloc, back, 1, false);
+
+    // used once it typed or clicked, so the next reconnect follows
+    const used = try testIdentified(alloc, &daemon, b[0], false, "o3");
+    try daemon.handleInit(alloc, used, pty, &term, size);
+    try daemon.handleInput(alloc, used, "\x1b[<0;4;4M");
+    try std.testing.expect(!daemon.leader_idle);
+    const late = try testIdentified(alloc, &daemon, b[1], false, "v3\nv2");
+    try daemon.handleInit(alloc, late, pty, &term, size);
+    try std.testing.expectEqual(@as(?i32, b[0]), daemon.leader_client_fd);
+    try std.testing.expectEqual(ipc.Role.follower, queuedRoles(late).last.?.role);
+
+    _ = daemon.closeClient(alloc, late, 2, false);
+    _ = daemon.closeClient(alloc, used, 1, false);
+    _ = daemon.closeClient(alloc, fallback, 0, false);
 }
 
 test "switch moves a stock leader and leaves a managed one bound to its session" {

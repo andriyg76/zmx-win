@@ -44,6 +44,22 @@ pub fn claimFromEnv() bool {
     return lib_posix.getenv("ZMX_MANAGED_CLAIM") != null;
 }
 
+/// The token of an earlier attach of this pane whose lead the hosting terminal takes back after the
+/// link dropped. Null when unset or not a plain token.
+pub fn reclaimFromEnv() ?[]const u8 {
+    const value = lib_posix.getenv("ZMX_MANAGED_RECLAIM") orelse return null;
+    return if (isNonce(value)) value else null;
+}
+
+pub const IdentityBuf = [NONCE_MAX * 2 + 1]u8;
+
+/// The Identity payload: `nonce`, then a newline and `reclaim` when there is one.
+pub fn identity(buf: *IdentityBuf, nonce: []const u8, reclaim: ?[]const u8) []const u8 {
+    const from = reclaim orelse return std.fmt.bufPrint(buf, "{s}", .{nonce}) catch unreachable;
+    return std.fmt.bufPrint(buf, "{s}\n{s}", .{ nonce, from }) catch unreachable;
+}
+
+
 pub const Relay = struct {
     stream: ghostty_vt.Stream(NoopHandler),
     nonce: []const u8,
@@ -139,6 +155,12 @@ test "isNonce accepts plain tokens only" {
     try testing.expect(!isNonce("a;b"));
     try testing.expect(!isNonce("a b"));
     try testing.expect(!isNonce(&@as([NONCE_MAX + 1]u8, @splat('x'))));
+}
+
+test "identity carries the reclaimed token after a newline" {
+    var buf: IdentityBuf = undefined;
+    try testing.expectEqualStrings("n2", identity(&buf, "n2", null));
+    try testing.expectEqualStrings("n2\nn1", identity(&buf, "n2", "n1"));
 }
 
 test "role at ground is written at once" {
