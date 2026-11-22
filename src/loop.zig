@@ -391,17 +391,6 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                     daemon.has_pty_output = true;
                     daemon.screen_revision +%= 1;
 
-                    // When no real terminal client has attached yet, respond to
-                    // terminal queries (e.g. DA1/DA2) on behalf of the terminal.
-                    // This prevents fish from waiting 10s for unanswered queries.
-                    // Only clients that sent .Init (a real zmx attach) count,
-                    // not a `zmx run` tail-only client.
-                    if (!daemon.hasTerminalClient() and
-                        daemon.pty_write_buf.items.len < Daemon.PTY_WRITE_BUF_MAX)
-                    {
-                        util.respondToDeviceAttributes(gpa, &daemon.pty_write_buf, buf[0..n]);
-                    }
-
                     // In run mode, scan output for exit code marker. The marker
                     // can straddle two PTY reads (more likely under a throttled
                     // scheduler, e.g. containers), so prepend the tail carried
@@ -432,21 +421,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                         );
                     }
 
-                    // Broadcast data to all clients.
-                    // Rewrite OSC 133;A to include redraw=0 so the outer terminal
-                    // does not clear prompt lines on resize (issue #111).
-                    const broadcast_data = util.rewritePromptRedraw(gpa, buf[0..n]) orelse buf[0..n];
-                    defer if (broadcast_data.ptr != buf[0..n].ptr) gpa.free(broadcast_data);
-                    for (daemon.clients.items) |client| {
-                        ipc.appendMessage(gpa, &client.write_buf, .Output, broadcast_data) catch |err| {
-                            std.log.warn(
-                                "failed to buffer output for client err={s}",
-                                .{@errorName(err)},
-                            );
-                            continue;
-                        };
-                        client.has_pending_output = true;
-                    }
+                    daemon.relayPtyOutput(gpa, buf[0..n]);
                 }
             }
         }
@@ -986,6 +961,31 @@ pub const Daemon = struct {
             }
         }
         return null;
+    }
+
+    /// relayPtyOutput answers DA queries while no terminal client is attached, then broadcasts the rest of `data`.
+    fn relayPtyOutput(self: *Daemon, gpa: std.mem.Allocator, data: []u8) void {
+        // until a client sends Init the daemon answers for the terminal, so fish never waits 10 s; an attach
+        // that has not sent Init yet still receives output, and would answer a forwarded query a second time
+        var output = data;
+        if (!self.hasTerminalClient() and self.pty_write_buf.items.len < PTY_WRITE_BUF_MAX) {
+            output = util.respondToDeviceAttributes(gpa, &self.pty_write_buf, data);
+        }
+        if (output.len == 0) return;
+
+        // redraw=0 keeps the outer terminal from clearing prompt lines on resize (issue #111)
+        const broadcast_data = util.rewritePromptRedraw(gpa, output) orelse output;
+        defer if (broadcast_data.ptr != output.ptr) gpa.free(broadcast_data);
+        for (self.clients.items) |client| {
+            ipc.appendMessage(gpa, &client.write_buf, .Output, broadcast_data) catch |err| {
+                std.log.warn(
+                    "failed to buffer output for client err={s}",
+                    .{@errorName(err)},
+                );
+                continue;
+            };
+            client.has_pending_output = true;
+        }
     }
 
     const PTY_WRITE_BUF_MAX = 256 * 1024;
@@ -1632,6 +1632,56 @@ test "hasTerminalClient follows attach, detach and detach-all" {
     daemon.handleDetachAll(alloc);
     try std.testing.expect(!daemon.hasTerminalClient());
     try std.testing.expectEqual(@as(?i32, null), daemon.leader_client_fd);
+}
+
+fn queuedOutput(client: *const Client, out: []u8) []const u8 {
+    var len: usize = 0;
+    var rest: []const u8 = client.write_buf.items;
+    while (rest.len >= @sizeOf(ipc.Header)) {
+        const header = std.mem.bytesToValue(ipc.Header, rest[0..@sizeOf(ipc.Header)]);
+        const body = rest[@sizeOf(ipc.Header)..][0..header.len];
+        if (header.tag == .Output) {
+            @memcpy(out[len..][0..body.len], body);
+            len += body.len;
+        }
+        rest = rest[@sizeOf(ipc.Header) + header.len ..];
+    }
+    return out[0..len];
+}
+
+// regression: the creation attach's terminal answered a DA query the daemon had already answered before its Init
+test "a DA query the daemon answers is not forwarded until a client sent Init" {
+    const alloc = std.testing.allocator;
+    var daemon = testDaemon();
+    defer daemon.clients.deinit(alloc);
+    defer daemon.pty_write_buf.deinit(alloc);
+    const fds = try lib_posix.pipe2(.{});
+    defer lib_posix.close(fds[1]);
+    const client = try testClient(alloc, fds[0], false);
+    try daemon.clients.append(alloc, client);
+    defer _ = daemon.closeClient(alloc, client, 0, false);
+    var seen: [256]u8 = undefined;
+
+    var read1 = "a\x1b[cb\x1b[>0c\x1b[?62;22cz\x1b[".*;
+    daemon.relayPtyOutput(alloc, &read1);
+    try std.testing.expectEqualStrings("\x1b[?62;22c\x1b[>1;10;0c", daemon.pty_write_buf.items);
+    try std.testing.expectEqualStrings("ab\x1b[?62;22cz\x1b[", queuedOutput(client, &seen));
+
+    var read2 = "c".*;
+    daemon.relayPtyOutput(alloc, &read2);
+    try std.testing.expectEqualStrings("\x1b[?62;22c\x1b[>1;10;0c", daemon.pty_write_buf.items);
+    try std.testing.expectEqualStrings("ab\x1b[?62;22cz\x1b[c", queuedOutput(client, &seen));
+
+    var read3 = "\x1b[c".*;
+    daemon.relayPtyOutput(alloc, &read3);
+    try std.testing.expectEqualStrings("ab\x1b[?62;22cz\x1b[c", queuedOutput(client, &seen));
+
+    client.is_terminal = true;
+    daemon.pty_write_buf.clearRetainingCapacity();
+    var read4 = "x\x1b[cy".*;
+    daemon.relayPtyOutput(alloc, &read4);
+    try std.testing.expectEqualStrings("", daemon.pty_write_buf.items);
+    try std.testing.expectEqualStrings("ab\x1b[?62;22cz\x1b[cx\x1b[cy", queuedOutput(client, &seen));
 }
 
 test "send queues PTY input without changing leader" {

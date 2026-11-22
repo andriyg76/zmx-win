@@ -267,7 +267,17 @@ const DA2_QUERY_EXPLICIT = "\x1b[>0c";
 const DA1_RESPONSE = "\x1b[?62;22c";
 const DA2_RESPONSE = "\x1b[>1;10;0c";
 
-pub fn respondToDeviceAttributes(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), data: []const u8) void {
+const DaQuery = struct { seq: []const u8, response: []const u8 };
+const da_queries = [_]DaQuery{
+    .{ .seq = DA1_QUERY, .response = DA1_RESPONSE },
+    .{ .seq = DA1_QUERY_EXPLICIT, .response = DA1_RESPONSE },
+    .{ .seq = DA2_QUERY, .response = DA2_RESPONSE },
+    .{ .seq = DA2_QUERY_EXPLICIT, .response = DA2_RESPONSE },
+};
+
+/// respondToDeviceAttributes queues a reply to every complete DA query in `data` and removes each query it
+/// answered from `data`, returning the bytes left to forward.
+pub fn respondToDeviceAttributes(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), data: []u8) []u8 {
     // Scan for DA queries in PTY output and respond on behalf of the terminal.
     // This handles the case where no client is attached (e.g. zmx run)
     // and the shell (e.g. fish) sends a DA query that would otherwise go unanswered.
@@ -283,6 +293,8 @@ pub fn respondToDeviceAttributes(alloc: std.mem.Allocator, buf: *std.ArrayList(u
     //
     // We must NOT match DA responses (which contain '?') as queries.
     var i: usize = 0;
+    var len: usize = 0;
+    var run: usize = 0;
     while (i < data.len) {
         if (data[i] == '\x1b' and i + 1 < data.len and data[i + 1] == '[') {
             // Skip DA responses which have '?' after CSI
@@ -290,14 +302,23 @@ pub fn respondToDeviceAttributes(alloc: std.mem.Allocator, buf: *std.ArrayList(u
                 i += 3;
                 continue;
             }
-            if (matchSeq(data[i..], DA2_QUERY) or matchSeq(data[i..], DA2_QUERY_EXPLICIT)) {
-                buf.appendSlice(alloc, DA2_RESPONSE) catch {};
-            } else if (matchSeq(data[i..], DA1_QUERY) or matchSeq(data[i..], DA1_QUERY_EXPLICIT)) {
-                buf.appendSlice(alloc, DA1_RESPONSE) catch {};
+            const query: ?DaQuery = for (da_queries) |q| {
+                if (matchSeq(data[i..], q.seq)) break q;
+            } else null;
+            if (query) |q| {
+                if (buf.appendSlice(alloc, q.response)) {
+                    std.mem.copyForwards(u8, data[len..], data[run..i]);
+                    len += i - run;
+                    i += q.seq.len;
+                    run = i;
+                    continue;
+                } else |_| {}
             }
         }
         i += 1;
     }
+    std.mem.copyForwards(u8, data[len..], data[run..]);
+    return data[0 .. len + data.len - run];
 }
 
 fn matchSeq(data: []const u8, seq: []const u8) bool {
