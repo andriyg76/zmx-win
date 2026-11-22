@@ -265,6 +265,9 @@ pub fn wait(pid: i32) u32 {
 pub fn resize(fd: posix.fd_t, rows: u16, cols: u16) bool {
     const pty: *Pty = @ptrCast(@alignCast(posix.ptyOf(fd) orelse return false));
     if (rows == 0 or cols == 0) return false;
+    // a resize repaints the whole console, and every attach sends one; at the same size it would follow the
+    // daemon's own redraw with a second one
+    if (pty.rows == rows and pty.cols == cols) return true;
     pty.rows = rows;
     pty.cols = cols;
     if (pty.closed.load(.acquire)) return true;
