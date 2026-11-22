@@ -614,7 +614,7 @@ test "legacy headers carry agterm 0.8.1 tag numbers" {
 test "probe identifies both wire formats after unsolicited output" {
     for ([_]Wire{ .current, .legacy }) |wire| {
         var fds: [2]i32 = undefined;
-        if (std.c.socketpair(lib_posix.AF.UNIX, lib_posix.SOCK.STREAM, 0, &fds) != 0) return error.NoSocketPair;
+        if (@import("sys.zig").socketpair(&fds) != 0) return error.NoSocketPair;
         defer for (fds) |fd| lib_posix.close(fd);
 
         const peer: Connection = .{ .fd = fds[0], .wire = wire };
@@ -633,7 +633,7 @@ test "probe identifies both wire formats after unsolicited output" {
 test "probe settles a busy current daemon's first frame that reads in both framings" {
     // regression: a busy daemon's 4096-byte Output reads as a padded 0.8.1 one-byte Output
     var fds: [2]i32 = undefined;
-    if (std.c.socketpair(lib_posix.AF.UNIX, lib_posix.SOCK.STREAM, 0, &fds) != 0) return error.NoSocketPair;
+    if (@import("sys.zig").socketpair(&fds) != 0) return error.NoSocketPair;
     defer for (fds) |fd| lib_posix.close(fd);
     var text: [4096]u8 = undefined;
     @memset(&text, 'y');
@@ -664,7 +664,7 @@ test "probe refuses to guess when the bytes after an ambiguous frame open a lega
     const cases = [_][]const []const u8{ &.{ &padded_output, &legacy_info }, &.{ &current_output, &current_info } };
     for (cases) |frames| {
         var fds: [2]i32 = undefined;
-        if (std.c.socketpair(lib_posix.AF.UNIX, lib_posix.SOCK.STREAM, 0, &fds) != 0) return error.NoSocketPair;
+        if (@import("sys.zig").socketpair(&fds) != 0) return error.NoSocketPair;
         defer for (fds) |fd| lib_posix.close(fd);
         for (frames) |frame| try writeAll(fds[0], frame);
         try std.testing.expectError(error.Ambiguous, readProbeReply(fds[1]));
@@ -673,7 +673,7 @@ test "probe refuses to guess when the bytes after an ambiguous frame open a lega
 
 test "probe reads a padded legacy task completion as legacy" {
     var fds: [2]i32 = undefined;
-    if (std.c.socketpair(lib_posix.AF.UNIX, lib_posix.SOCK.STREAM, 0, &fds) != 0) return error.NoSocketPair;
+    if (@import("sys.zig").socketpair(&fds) != 0) return error.NoSocketPair;
     defer for (fds) |fd| lib_posix.close(fd);
     try writeAll(fds[0], &[_]u8{ 13, 1, 0, 0, 0, 7, 7, 7, 0 });
     var info = std.mem.zeroes(Info);
@@ -687,7 +687,7 @@ test "probe reads a padded legacy task completion as legacy" {
 
 test "a one-shot request reads as a one-byte request on a 0.8.1 daemon" {
     var fds: [2]i32 = undefined;
-    if (std.c.socketpair(lib_posix.AF.UNIX, lib_posix.SOCK.STREAM, 0, &fds) != 0) return error.NoSocketPair;
+    if (@import("sys.zig").socketpair(&fds) != 0) return error.NoSocketPair;
     defer for (fds) |fd| lib_posix.close(fd);
     try sendOneShot(fds[0], .info);
     var bytes: [@sizeOf(Header) + 1]u8 = undefined;

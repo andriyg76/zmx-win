@@ -12,4 +12,5 @@ comptime {
     _ = @import("lib.zig");
     _ = @import("client.zig");
     _ = @import("role.zig");
+    if (@import("builtin").os.tag == .windows) _ = @import("win/conpty.zig");
 }

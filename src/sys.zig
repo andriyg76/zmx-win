@@ -38,3 +38,12 @@ extern "kernel32" fn GetComputerNameExA(kind: i32, buf: [*]u8, n: *u32) callconv
 pub fn getpid() i32 {
     return if (builtin.os.tag == .windows) posix.getpid() else std.c.getpid();
 }
+
+/// A connected pair of stream sockets in `fds`, returning 0 or -1 as socketpair(2) does.
+pub fn socketpair(fds: *[2]i32) c_int {
+    if (builtin.os.tag == .windows) {
+        fds.* = posix.pipe2(.{}) catch return -1;
+        return 0;
+    }
+    return std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, fds);
+}

@@ -13,7 +13,10 @@ const macos_targets: []const std.Target.Query = &.{
 };
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    // zmx's Windows port links the libc Zig ships for the GNU ABI; MSVC's would need a Windows SDK
+    const target = b.standardTargetOptions(.{
+        .default_target = if (@import("builtin").os.tag == .windows) .{ .abi = .gnu } else .{},
+    });
     // const is_macos = target.result.os.tag == .macos;
     const optimize = b.standardOptimizeOption(.{});
     const version = b.option([]const u8, "version", "Version string for release") orelse

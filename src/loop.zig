@@ -2442,6 +2442,8 @@ extern "c" fn ptsname(fd: c_int) ?[*:0]const u8;
 
 /// A raw PTY of the given size, so what is written to one side reaches the other byte for byte.
 fn testPty(rows: u16, cols: u16) ![2]i32 {
+    // Windows has no PTY pair to read a client's bytes from; its sessions run under ConPTY
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const master = try lib_posix.open("/dev/ptmx", .{ .ACCMODE = .RDWR, .NOCTTY = true }, 0);
     errdefer lib_posix.close(master);
     if (grantpt(master) != 0 or unlockpt(master) != 0) return error.PtyUnavailable;
@@ -2504,7 +2506,7 @@ const EndingSession = struct {
         // the session socket is a pair whose sizes the test sets, so no host default decides what the
         // daemon keeps; the daemon's end is a client as an accept would make it
         var pair: [2]i32 = undefined;
-        if (std.c.socketpair(lib_posix.AF.UNIX, lib_posix.SOCK.STREAM, 0, &pair) != 0) return error.NoSocketPair;
+        if (@import("sys.zig").socketpair(&pair) != 0) return error.NoSocketPair;
         for (pair) |fd| setBuffers(fd);
         _ = try lib_posix.fcntl(pair[0], lib_posix.F.SETFL, lib_posix.O_NONBLOCK);
         try self.daemon.clients.append(alloc, try testClient(alloc, pair[0], false));
@@ -2524,6 +2526,7 @@ const EndingSession = struct {
     }
 
     fn setBuffers(fd: i32) void {
+        if (builtin.os.tag == .windows) return;
         const size: c_int = 8192;
         for ([_]u32{ std.c.SO.SNDBUF, std.c.SO.RCVBUF }) |opt| {
             _ = std.c.setsockopt(fd, std.c.SOL.SOCKET, opt, std.mem.asBytes(&size), @sizeOf(c_int));
@@ -2837,6 +2840,8 @@ fn signalFor(thread: std.c.pthread_t, ms: i64) void {
 }
 
 test "signals do not stretch a write bounded by a deadline" {
+    // Windows delivers no signals to interrupt a write
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const pty = try testPty(24, 80);
     defer for (pty) |fd| lib_posix.close(fd);
     const flags = try lib_posix.fcntl(pty[1], lib_posix.F.GETFL, 0);
