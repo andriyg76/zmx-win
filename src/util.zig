@@ -235,6 +235,30 @@ pub fn shellNeedsQuoting(arg: []const u8) bool {
     return false;
 }
 
+/// How `zmx run` passes one argument to a Windows shell, cmd or PowerShell: in double quotes when it holds a
+/// space or tab or is empty, else as it is, backslashes of a path included.
+pub fn windowsArg(alloc: std.mem.Allocator, arg: []const u8) ![]u8 {
+    if (arg.len > 0 and std.mem.indexOfAny(u8, arg, " \t") == null) return alloc.dupe(u8, arg);
+    return std.fmt.allocPrint(alloc, "\"{s}\"", .{arg});
+}
+
+test "windowsArg quotes only an argument with a space or tab" {
+    const alloc = std.testing.allocator;
+    const cases = [_][2][]const u8{
+        .{ "dir", "dir" },
+        .{ "C:\\Program Files\\x", "\"C:\\Program Files\\x\"" },
+        .{ "C:\\nope", "C:\\nope" },
+        .{ "a\tb", "\"a\tb\"" },
+        .{ "", "\"\"" },
+        .{ "$env:PATH", "$env:PATH" },
+    };
+    for (cases) |c| {
+        const got = try windowsArg(alloc, c[0]);
+        defer alloc.free(got);
+        try std.testing.expectEqualStrings(c[1], got);
+    }
+}
+
 pub fn shellQuote(alloc: std.mem.Allocator, arg: []const u8) ![]u8 {
     // Always use single quotes (like Python's shlex.quote). Inside single
     // quotes nothing is special except ' itself, which we handle with the

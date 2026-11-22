@@ -476,7 +476,11 @@ pub fn run(
 
         for (command, 0..) |arg, i| {
             if (i > 0) try cmd_list.append(alloc, ' ');
-            if (util.shellNeedsQuoting(arg)) {
+            if (@import("builtin").os.tag == .windows) {
+                const quoted = try util.windowsArg(alloc, arg);
+                defer alloc.free(quoted);
+                try cmd_list.appendSlice(alloc, quoted);
+            } else if (util.shellNeedsQuoting(arg)) {
                 const quoted = try util.shellQuote(alloc, arg);
                 defer alloc.free(quoted);
                 try cmd_list.appendSlice(alloc, quoted);
