@@ -31,6 +31,18 @@ pub const Tag = enum(u8) {
     /// Scoped history: the active screen plus a bounded number of
     /// preceding scrollback rows. Request payload is `Capture`.
     Capture = 22,
+    /// client -> daemon, before Init: this client takes part in explicit
+    /// leadership. Payload is one `ManageFlags` byte.
+    Manage = 26,
+    /// daemon -> managed client: its role changed. Payload is a `RoleChange`.
+    Role = 23,
+    /// request: one `ScreenMode` byte.
+    /// reply: a `ScreenHeader` followed by the text, or an empty payload for a mode it does not know.
+    Screen = 24,
+    /// request: typed text, each CR a Return key, encoded by the daemon for the
+    /// session's keyboard mode and queued without taking the lead.
+    /// reply: one `TypeResult` byte. Accepted means queued, not executed.
+    Type = 25,
     Unsupported = 255,
     // Non-exhaustive: this enum comes off the wire via bytesToValue and
     // @enumFromInt, so out-of-range values are representable
@@ -98,6 +110,51 @@ pub fn getTerminalSize(fd: i32) Resize {
 }
 
 pub const MAX_PAYLOAD_LEN: usize = 64 * 1024 * 1024;
+
+pub const ManageFlags = packed struct(u8) {
+    /// take the lead when this client's Init arrives, even from a live leader
+    claim: bool = false,
+    _pad: u7 = 0,
+};
+
+pub const Role = enum(u8) {
+    /// no client leads; the pty keeps its last size until one claims
+    unowned = 0,
+    leader = 1,
+    follower = 2,
+};
+
+pub const RoleChange = extern struct {
+    /// counts leadership changes of this daemon, so a client can drop a stale one
+    generation: u32,
+    role: Role,
+};
+
+pub const TypeResult = enum(u8) {
+    accepted = 0,
+    /// the pty input queue is full; nothing was queued
+    rejected = 1,
+};
+
+pub const ScreenMode = enum(u8) {
+    /// the visible screen only
+    active = 0,
+    /// scrollback followed by the visible screen
+    all = 1,
+    _,
+};
+
+pub const ScreenHeader = extern struct {
+    /// advances on every pty read, resize and injected output, so two replies can be told apart
+    revision: u64,
+    cols: u16,
+    rows: u16,
+    /// zero-based, in the active screen
+    cursor_x: u16,
+    cursor_y: u16,
+    alternate: u8,
+};
+
 pub const MAX_CMD_LEN = 256;
 pub const MAX_CWD_LEN = 256;
 
@@ -357,6 +414,8 @@ test "Tag wire values are frozen" {
         .{ Tag.LabelSet, 15 }, .{ Tag.LabelClear, 16 },   .{ Tag.LabelData, 17 },
         .{ Tag.Send, 18 },     .{ Tag.EnvGet, 19 },       .{ Tag.EnvSet, 20 },
         .{ Tag.EnvData, 21 },  .{ Tag.Capture, 22 },      .{ Tag.Unsupported, 255 },
+        .{ Tag.Role, 23 },     .{ Tag.Screen, 24 },       .{ Tag.Type, 25 },
+        .{ Tag.Manage, 26 },
     }) |p| try std.testing.expectEqual(@as(u8, p[1]), @backingInt(p[0]));
 }
 
@@ -390,6 +449,41 @@ pub fn roundTripForTag(
         }
     }
     return error.Unexpected;
+}
+
+/// Like `roundTripForTag`, for a reply larger than one socket read. `timeout_ms`
+/// bounds each wait, so a daemon that ignores the request tag ends in `Timeout`.
+pub fn roundTripLarge(
+    alloc: std.mem.Allocator,
+    socket_path: []const u8,
+    request_tag: Tag,
+    payload: []const u8,
+    expected_tag: Tag,
+    timeout_ms: i32,
+) SessionProbeError![]u8 {
+    const fd = try connectSession(socket_path);
+    defer lib_posix.close(fd);
+
+    send(fd, request_tag, payload) catch return error.Unexpected;
+
+    var sb = SocketBuffer.init(alloc) catch return error.Unexpected;
+    defer sb.deinit();
+
+    while (true) {
+        var poll_fds = [_]lib_posix.pollfd{.{ .fd = fd, .events = lib_posix.POLL.IN, .revents = 0 }};
+        const poll_result = lib_posix.poll(&poll_fds, timeout_ms) catch return error.Unexpected;
+        if (poll_result == 0) return error.Timeout;
+
+        const n = sb.read(fd) catch return error.Unexpected;
+        if (n == 0) return error.Unexpected;
+
+        while (sb.next()) |msg| {
+            if (msg.header.tag == .Unsupported) return error.Unsupported;
+            if (msg.header.tag == expected_tag) {
+                return alloc.dupe(u8, msg.payload) catch return error.Unexpected;
+            }
+        }
+    }
 }
 
 test "zeroed Info has no stack garbage in wire bytes" {

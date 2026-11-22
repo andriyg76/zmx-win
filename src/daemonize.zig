@@ -81,6 +81,11 @@ fn exec(sesh_name: []const u8, cmd: Cmd) !noreturn {
         _ = cross.putenv(@constCast("TERM=xterm-256color"));
     }
 
+    // the shell inherits the first attach client's environment, and a nested `zmx attach` run from
+    // it must not opt in on the outer terminal's behalf or learn its nonce
+    _ = cross.unsetenv("ZMX_MANAGED");
+    _ = cross.unsetenv("ZMX_MANAGED_CLAIM");
+
     const err = lib_posix.execvpeZ(cmd.file, cmd.argv_ptr, std.c.environ);
     std.log.err("execvpe failed: cmd={s} err={s}", .{ cmd.file, @errorName(err) });
     lib_posix.exit(1);

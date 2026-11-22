@@ -5,6 +5,7 @@ const util = @import("util.zig");
 const cross = @import("cross");
 const socket = @import("socket.zig");
 const label = @import("label.zig");
+const role = @import("role.zig");
 const lib_posix = @import("posix.zig");
 const Cfg = @import("cfg.zig");
 const signal = @import("signal.zig");
@@ -48,6 +49,13 @@ pub fn clientLoop(client_sock_fd: i32, env_str: []const u8) !ClientResult {
 
     if (env_str.len > 0) {
         try ipc.appendMessage(gpa, &sock_write_buf, .EnvSet, env_str);
+    }
+
+    var relay: ?role.Relay = if (role.nonceFromEnv()) |nonce| role.Relay.init(nonce) else null;
+    defer if (relay) |*r| r.deinit();
+    if (relay != null) {
+        const flags = ipc.ManageFlags{ .claim = role.claimFromEnv() };
+        try ipc.appendMessage(gpa, &sock_write_buf, .Manage, std.mem.asBytes(&flags));
     }
 
     // Send init message with terminal size (buffered)
@@ -104,7 +112,9 @@ pub fn clientLoop(client_sock_fd: i32, env_str: []const u8) !ClientResult {
             });
         }
 
-        _ = try lib_posix.poll(poll_fds.items, -1);
+        const poll_timeout: i32 = if (relay) |*r| r.pollTimeout(role.nowMs()) else -1;
+        _ = try lib_posix.poll(poll_fds.items, poll_timeout);
+        if (relay) |*r| try r.expire(gpa, &stdout_buf, role.nowMs());
 
         if (poll_fds.items[2].revents & lib_posix.POLL.IN != 0) {
             try signal.drainSignalPipe();
@@ -162,8 +172,16 @@ pub fn clientLoop(client_sock_fd: i32, env_str: []const u8) !ClientResult {
             while (read_buf.next()) |msg| {
                 switch (msg.header.tag) {
                     .Output => {
-                        if (msg.payload.len > 0) {
+                        if (relay) |*r| {
+                            try r.forward(gpa, &stdout_buf, msg.payload);
+                        } else if (msg.payload.len > 0) {
                             try stdout_buf.appendSlice(gpa, msg.payload);
+                        }
+                    },
+                    .Role => if (relay) |*r| {
+                        if (msg.payload.len == @sizeOf(ipc.RoleChange)) {
+                            const change = std.mem.bytesToValue(ipc.RoleChange, msg.payload);
+                            try r.roleChanged(gpa, &stdout_buf, change, role.nowMs());
                         }
                     },
                     .Resize => {
@@ -369,6 +387,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                     vt_stream.nextSlice(buf[0..n]);
                     daemon.setPwd(&term);
                     daemon.has_pty_output = true;
+                    daemon.screen_revision +%= 1;
 
                     // When no real terminal client has attached yet, respond to
                     // terminal queries (e.g. DA1/DA2) on behalf of the terminal.
@@ -507,7 +526,10 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                         .History => try daemon.handleHistory(gpa, client, &term, msg.payload),
                         .Capture => try daemon.handleCapture(gpa, client, &term, msg.payload),
                         .Run => try daemon.handleRun(gpa, io, client, msg.payload),
-                        .Ack, .TaskComplete, .LabelData, .EnvData, .Unsupported => {},
+                        .Manage => daemon.handleManage(client, msg.payload),
+                        .Type => try daemon.handleType(gpa, client, &term, msg.payload),
+                        .Screen => try daemon.handleScreen(gpa, client, &term, msg.payload),
+                        .Ack, .TaskComplete, .LabelData, .EnvData, .Role, .Unsupported => {},
                         .Write => try daemon.handleWrite(gpa, client, msg.payload),
                         _ => {
                             std.log.warn(
@@ -571,6 +593,10 @@ pub const Client = struct {
     socket_fd: i32,
     has_pending_output: bool = false,
     is_terminal: bool = false, // sent .Init (a `zmx attach`), not a run/send/tail client
+    /// sent .Manage: leads only by claiming, never by typing, and is told its role
+    managed: bool = false,
+    claim_on_init: bool = false,
+    told_role: ?ipc.Role = null,
     read_buf: ipc.SocketBuffer,
     write_buf: std.ArrayList(u8),
     env_str: ?[]u8 = null,
@@ -607,6 +633,10 @@ pub const Daemon = struct {
     // This control which client is the leader.  The leader controls terminal state and
     // cols/rows of session.
     leader_client_fd: ?i32 = null,
+    /// bumped on every leadership change, carried in each RoleChange
+    leader_generation: u32 = 0,
+    /// bumped on every pty read, resize and injected output, carried in each ScreenHeader
+    screen_revision: u64 = 0,
     running: bool = true,
     pid: i32 = undefined,
     command: ?[]const []const u8 = null,
@@ -694,10 +724,12 @@ pub const Daemon = struct {
                 .{ self.session_name, client.socket_fd },
             );
             self.leader_client_fd = null;
+            self.leader_generation +%= 1;
         }
         client.deinit(gpa);
         gpa.destroy(client);
         _ = self.clients.orderedRemove(i);
+        self.notifyRoles(gpa);
         std.log.info("client disconnected fd={d} remaining={d}", .{ fd, self.clients.items.len });
         if (shutdown_on_last and self.clients.items.len == 0) {
             self.shutdown(gpa);
@@ -876,9 +908,66 @@ pub const Daemon = struct {
     fn setLeader(self: *Daemon, gpa: std.mem.Allocator, client: *Client) !void {
         std.log.info("setting new leader client_fd={d}", .{client.socket_fd});
         self.leader_client_fd = client.socket_fd;
+        self.leader_generation +%= 1;
         // Send a resize message to the client so it can send us back their window size
         // so we can resize the pty and ghostty state.
         try ipc.appendMessage(gpa, &client.write_buf, .Resize, "");
+        client.has_pending_output = true;
+        self.notifyRoles(gpa);
+    }
+
+    fn roleOf(self: *const Daemon, client: *const Client) ipc.Role {
+        const leader = self.leader_client_fd orelse return .unowned;
+        return if (leader == client.socket_fd) .leader else .follower;
+    }
+
+    /// Tell every managed terminal client whose role differs from the last one it was told.
+    fn notifyRoles(self: *Daemon, gpa: std.mem.Allocator) void {
+        for (self.clients.items) |client| {
+            if (!client.managed or !client.is_terminal) continue;
+            const current = self.roleOf(client);
+            if (client.told_role == current) continue;
+            client.told_role = current;
+            // zeroes() so asBytes() ships no struct padding
+            var change = std.mem.zeroes(ipc.RoleChange);
+            change.generation = self.leader_generation;
+            change.role = current;
+            ipc.appendMessage(gpa, &client.write_buf, .Role, std.mem.asBytes(&change)) catch |err| {
+                std.log.warn("failed to buffer role for client err={s}", .{@errorName(err)});
+                client.told_role = null;
+                continue;
+            };
+            client.has_pending_output = true;
+        }
+    }
+
+    pub fn handleManage(self: *Daemon, client: *Client, payload: []const u8) void {
+        _ = self;
+        if (payload.len != @sizeOf(ipc.ManageFlags)) return;
+        const flags = std.mem.bytesToValue(ipc.ManageFlags, payload);
+        client.managed = true;
+        client.claim_on_init = flags.claim;
+    }
+
+    /// Queue automation bytes without touching leadership, and say whether they were queued.
+    pub fn handleType(
+        self: *Daemon,
+        gpa: std.mem.Allocator,
+        client: *Client,
+        term: *const ghostty_vt.Terminal,
+        payload: []const u8,
+    ) !void {
+        const keys = terminal.encodeTyped(gpa, term, payload) catch |err| {
+            std.log.warn("failed to encode typed input err={s}", .{@errorName(err)});
+            try ipc.appendMessage(gpa, &client.write_buf, .Type, &[_]u8{@backingInt(ipc.TypeResult.rejected)});
+            client.has_pending_output = true;
+            return;
+        };
+        defer gpa.free(keys);
+        const fits = keys.len > 0 and self.pty_write_buf.items.len + keys.len <= PTY_WRITE_BUF_MAX;
+        if (fits) self.queuePtyInput(gpa, keys);
+        const result: ipc.TypeResult = if (fits) .accepted else .rejected;
+        try ipc.appendMessage(gpa, &client.write_buf, .Type, &[_]u8{@backingInt(result)});
         client.has_pending_output = true;
     }
 
@@ -929,6 +1018,10 @@ pub const Daemon = struct {
             return;
         }
 
+        // a managed client leads only by claiming: what it sends while following is its terminal
+        // answering queries, or a person typing at a pane that is covered
+        if (client.managed) return;
+
         // check if leader needs to be updated by detecting any user input
         if (util.isUserInput(payload)) {
             try self.setLeader(gpa, client);
@@ -944,6 +1037,13 @@ pub const Daemon = struct {
     pub fn handleSwitch(self: *Daemon, gpa: std.mem.Allocator, session_name: []const u8) !void {
         for (self.clients.items) |client| {
             if (self.leader_client_fd == client.socket_fd) {
+                // a managed client's terminal is bound to THIS session: its token, its role generation
+                // and what it reads and types through `screen` and `type` all name it, so moving the
+                // client to another daemon would leave every one of them pointing at the wrong session
+                if (client.managed) {
+                    std.log.info("ignoring switch to {s}: the leader is a managed client", .{session_name});
+                    return;
+                }
                 // Include the daemon's current cwd so the new session can start
                 // in the right directory. A remote cwd is left out: it names no
                 // directory here, so the new session is better off with the
@@ -990,9 +1090,11 @@ pub const Daemon = struct {
         }
         client.is_terminal = true;
 
-        if (self.leader_client_fd == null) {
+        if (self.leader_client_fd == null or client.claim_on_init) {
             try self.setLeader(gpa, client);
         }
+        // ahead of the snapshot below, so a managed client learns its role before any output
+        self.notifyRoles(gpa);
         const is_leader = self.leader_client_fd == client.socket_fd;
         const resize = std.mem.bytesToValue(ipc.Resize, payload);
 
@@ -1004,6 +1106,7 @@ pub const Daemon = struct {
         // shell's own SIGWINCH redraw still arrives after the snapshot.
         if (is_leader) {
             try resizeTerm(gpa, term, resize.cols, resize.rows);
+            self.screen_revision +%= 1;
         }
 
         if (self.has_pty_output) {
@@ -1012,7 +1115,7 @@ pub const Daemon = struct {
                 "cursor before serialize: x={d} y={d} pending_wrap={}",
                 .{ cursor.x, cursor.y, cursor.pending_wrap },
             );
-            if (util.serializeTerminalState(gpa, term)) |term_output| {
+            if (terminal.serializeTerminalState(gpa, term)) |term_output| {
                 std.log.debug("serialize terminal state", .{});
                 // Rewrite OSC 133;A to include redraw=0 so the outer terminal
                 // does not clear prompt lines on resize (issue #111).
@@ -1058,7 +1161,8 @@ pub const Daemon = struct {
         payload: []const u8,
     ) !void {
         if (payload.len != @sizeOf(ipc.Resize)) return;
-        if (self.leader_client_fd == null) {
+        // a managed client's window changing size is not a claim
+        if (self.leader_client_fd == null and !client.managed) {
             try self.setLeader(gpa, client);
         }
         // only leader can resize
@@ -1068,6 +1172,7 @@ pub const Daemon = struct {
         var ws = resize.winsize();
         _ = cross.ioctl(pty_fd, cross.TIOCSWINSZ, &ws);
         try resizeTerm(gpa, term, resize.cols, resize.rows);
+        self.screen_revision +%= 1;
         std.log.debug("resize rows={d} cols={d}", .{ resize.rows, resize.cols });
     }
 
@@ -1165,7 +1270,7 @@ pub const Daemon = struct {
             @fromBackingInt(@intCast(payload[0]))
         else
             .plain;
-        if (util.serializeTerminal(gpa, term, format)) |output| {
+        if (terminal.serializeTerminal(gpa, term, format)) |output| {
             defer gpa.free(output);
             try ipc.appendMessage(gpa, &client.write_buf, .History, output);
             client.has_pending_output = true;
@@ -1186,10 +1291,47 @@ pub const Daemon = struct {
         const request = std.mem.bytesToValue(ipc.Capture, payload);
         const format = std.enums.fromInt(util.HistoryFormat, request.format) orelse return;
         self.setPwd(term);
-        const output = util.serializeTerminalRange(gpa, term, format, request.rows);
+        const output = terminal.serializeTerminalRange(gpa, term, format, request.rows);
         defer if (output) |text| gpa.free(text);
         try ipc.appendMessage(gpa, &client.write_buf, .Capture, output orelse "");
         client.has_pending_output = true;
+    }
+
+    /// Read the daemon terminal using the current leader's layout.
+    pub fn handleScreen(
+        self: *Daemon,
+        gpa: std.mem.Allocator,
+        client: *Client,
+        term: *ghostty_vt.Terminal,
+        payload: []const u8,
+    ) !void {
+        defer client.has_pending_output = true;
+        const mode: ipc.ScreenMode = if (payload.len == 1) @enumFromInt(payload[0]) else .active;
+        const all = switch (mode) {
+            .active => false,
+            .all => true,
+            _ => return ipc.appendMessage(gpa, &client.write_buf, .Screen, ""),
+        };
+        const text = terminal.serializeScreenText(gpa, term, all) catch |err| {
+            std.log.warn("failed to read screen err={s}", .{@errorName(err)});
+            return ipc.appendMessage(gpa, &client.write_buf, .Screen, "");
+        };
+        defer gpa.free(text);
+
+        const screen = term.screens.active;
+        // zeroes() so asBytes() ships no struct padding
+        var header = std.mem.zeroes(ipc.ScreenHeader);
+        header.revision = self.screen_revision;
+        header.cols = @intCast(term.cols);
+        header.rows = @intCast(term.rows);
+        header.cursor_x = @intCast(screen.cursor.x);
+        header.cursor_y = @intCast(screen.cursor.y);
+        header.alternate = @intFromBool(term.screens.active_key == .alternate);
+        var reply = try std.ArrayList(u8).initCapacity(gpa, @sizeOf(ipc.ScreenHeader) + text.len);
+        defer reply.deinit(gpa);
+        reply.appendSliceAssumeCapacity(std.mem.asBytes(&header));
+        reply.appendSliceAssumeCapacity(text);
+        try ipc.appendMessage(gpa, &client.write_buf, .Screen, reply.items);
     }
 
     pub fn handleRun(self: *Daemon, gpa: std.mem.Allocator, io: std.Io, client: *Client, payload: []const u8) !void {
@@ -1278,6 +1420,7 @@ pub const Daemon = struct {
         vt_stream.nextSlice(payload);
         self.setPwd(term);
         self.has_pty_output = true;
+        self.screen_revision +%= 1;
         for (self.clients.items) |client| {
             try ipc.appendMessage(gpa, &client.write_buf, .Output, payload);
             client.has_pending_output = true;
@@ -1416,7 +1559,7 @@ test "terminal retains the configured scrollback without the default byte cap" {
     stream.nextSlice("first line\r\n");
     for (1..cfg.max_scrollback_lines) |_| stream.nextSlice("more output\r\n");
 
-    const history = util.serializeTerminal(alloc, &term, .plain) orelse return error.TestUnexpectedNull;
+    const history = terminal.serializeTerminal(alloc, &term, .plain) orelse return error.TestUnexpectedNull;
     defer alloc.free(history);
     try std.testing.expect(std.mem.startsWith(u8, history, "first line\n"));
 
@@ -1424,7 +1567,7 @@ test "terminal retains the configured scrollback without the default byte cap" {
     for (0..cfg.max_scrollback_lines) |_| stream.nextSlice("more output\r\n");
     stream.nextSlice("latest line\r\n");
 
-    const pruned_history = util.serializeTerminal(alloc, &term, .plain) orelse return error.TestUnexpectedNull;
+    const pruned_history = terminal.serializeTerminal(alloc, &term, .plain) orelse return error.TestUnexpectedNull;
     defer alloc.free(pruned_history);
     try std.testing.expect(std.mem.indexOf(u8, pruned_history, "first line") == null);
     try std.testing.expect(std.mem.indexOf(u8, pruned_history, "latest line") != null);
@@ -1493,6 +1636,244 @@ test "send queues PTY input without changing leader" {
 
     try std.testing.expectEqual(@as(?i32, 42), daemon.leader_client_fd);
     try std.testing.expectEqualStrings("hello", daemon.pty_write_buf.items);
+}
+
+/// The last RoleChange queued for `client`, and how many were queued.
+fn queuedRoles(client: *const Client) struct { last: ?ipc.RoleChange, count: usize } {
+    var last: ?ipc.RoleChange = null;
+    var count: usize = 0;
+    var rest: []const u8 = client.write_buf.items;
+    while (rest.len >= @sizeOf(ipc.Header)) {
+        const header = std.mem.bytesToValue(ipc.Header, rest[0..@sizeOf(ipc.Header)]);
+        const body = rest[@sizeOf(ipc.Header)..][0..header.len];
+        if (header.tag == .Role) {
+            last = std.mem.bytesToValue(ipc.RoleChange, body);
+            count += 1;
+        }
+        rest = rest[@sizeOf(ipc.Header) + header.len ..];
+    }
+    return .{ .last = last, .count = count };
+}
+
+fn testManaged(alloc: std.mem.Allocator, daemon: *Daemon, fd: i32, claim: bool) !*Client {
+    const client = try testClient(alloc, fd, false);
+    try daemon.clients.append(alloc, client);
+    const flags = ipc.ManageFlags{ .claim = claim };
+    daemon.handleManage(client, std.mem.asBytes(&flags));
+    return client;
+}
+
+test "a managed client leads by claiming, never by typing or resizing" {
+    const alloc = std.testing.allocator;
+    const cfg = Cfg{ .socket_dir = "", .log_dir = "" };
+    var term = try initTerminal(alloc, std.testing.io, .{ .cols = 80, .rows = 24 }, &cfg);
+    defer term.deinit(alloc);
+    var daemon = testDaemon();
+    defer daemon.clients.deinit(alloc);
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    const a = try lib_posix.pipe2(.{});
+    const b = try lib_posix.pipe2(.{});
+    defer lib_posix.close(b[1]);
+    const pty = b[0];
+    defer lib_posix.close(pty);
+    const size = std.mem.asBytes(&ipc.Resize{ .rows = 30, .cols = 100 });
+
+    // the first managed attach takes the vacant slot without asking for it
+    const origin = try testManaged(alloc, &daemon, a[0], false);
+    try daemon.handleInit(alloc, origin, pty, &term, size);
+    try std.testing.expectEqual(@as(?i32, a[0]), daemon.leader_client_fd);
+    try std.testing.expectEqual(ipc.Role.leader, queuedRoles(origin).last.?.role);
+
+    // a second one without the claim follows, and neither typing nor resizing promotes it
+    const viewer = try testManaged(alloc, &daemon, a[1], false);
+    try daemon.handleInit(alloc, viewer, pty, &term, size);
+    try std.testing.expectEqual(ipc.Role.follower, queuedRoles(viewer).last.?.role);
+    try daemon.handleInput(alloc, viewer, "typed by a person\r");
+    try daemon.handleResize(alloc, viewer, pty, &term, size);
+    try std.testing.expectEqual(@as(?i32, a[0]), daemon.leader_client_fd);
+    try std.testing.expectEqualStrings("", daemon.pty_write_buf.items);
+    try std.testing.expectEqual(@as(usize, 1), queuedRoles(viewer).count);
+
+    // the leader going away leaves the session unowned: a follower's resize is still not a claim
+    _ = daemon.closeClient(alloc, origin, 0, false);
+    try std.testing.expectEqual(@as(?i32, null), daemon.leader_client_fd);
+    try std.testing.expectEqual(ipc.Role.unowned, queuedRoles(viewer).last.?.role);
+    try daemon.handleResize(alloc, viewer, pty, &term, size);
+    try std.testing.expectEqual(@as(?i32, null), daemon.leader_client_fd);
+
+    _ = daemon.closeClient(alloc, viewer, 0, false);
+}
+
+test "a claiming attach takes the lead from a live leader and both are told" {
+    const alloc = std.testing.allocator;
+    const cfg = Cfg{ .socket_dir = "", .log_dir = "" };
+    var term = try initTerminal(alloc, std.testing.io, .{ .cols = 80, .rows = 24 }, &cfg);
+    defer term.deinit(alloc);
+    var daemon = testDaemon();
+    defer daemon.clients.deinit(alloc);
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    const a = try lib_posix.pipe2(.{});
+    const b = try lib_posix.pipe2(.{});
+    defer lib_posix.close(b[1]);
+    const pty = b[0];
+    defer lib_posix.close(pty);
+
+    const origin = try testManaged(alloc, &daemon, a[0], false);
+    try daemon.handleInit(alloc, origin, pty, &term, std.mem.asBytes(&ipc.Resize{ .rows = 59, .cols = 83 }));
+    const viewer = try testManaged(alloc, &daemon, a[1], true);
+    try daemon.handleInit(alloc, viewer, pty, &term, std.mem.asBytes(&ipc.Resize{ .rows = 60, .cols = 89 }));
+
+    try std.testing.expectEqual(@as(?i32, a[1]), daemon.leader_client_fd);
+    try std.testing.expectEqual(@as(usize, 89), term.cols);
+    const told_origin = queuedRoles(origin).last.?;
+    const told_viewer = queuedRoles(viewer).last.?;
+    try std.testing.expectEqual(ipc.Role.follower, told_origin.role);
+    try std.testing.expectEqual(ipc.Role.leader, told_viewer.role);
+    try std.testing.expectEqual(told_origin.generation, told_viewer.generation);
+
+    // the role reaches a managed client ahead of anything else its Init queues
+    const first = std.mem.bytesToValue(ipc.Header, viewer.write_buf.items[0..@sizeOf(ipc.Header)]);
+    try std.testing.expectEqual(ipc.Tag.Resize, first.tag);
+    const second = std.mem.bytesToValue(ipc.Header, viewer.write_buf.items[@sizeOf(ipc.Header)..][0..@sizeOf(ipc.Header)]);
+    try std.testing.expectEqual(ipc.Tag.Role, second.tag);
+
+    _ = daemon.closeClient(alloc, viewer, 1, false);
+    _ = daemon.closeClient(alloc, origin, 0, false);
+}
+
+test "switch moves a stock leader and leaves a managed one bound to its session" {
+    const alloc = std.testing.allocator;
+    var daemon = testDaemon();
+    defer daemon.clients.deinit(alloc);
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    const a = try lib_posix.pipe2(.{});
+    const stock = try testClient(alloc, a[0], true);
+    try daemon.clients.append(alloc, stock);
+    daemon.leader_client_fd = a[0];
+    try daemon.handleSwitch(alloc, "other");
+    const sent = std.mem.bytesToValue(ipc.Header, stock.write_buf.items[0..@sizeOf(ipc.Header)]);
+    try std.testing.expectEqual(ipc.Tag.Switch, sent.tag);
+
+    const managed = try testManaged(alloc, &daemon, a[1], true);
+    daemon.leader_client_fd = a[1];
+    try daemon.handleSwitch(alloc, "other");
+    try std.testing.expectEqual(@as(usize, 0), managed.write_buf.items.len);
+
+    _ = daemon.closeClient(alloc, managed, 1, false);
+    _ = daemon.closeClient(alloc, stock, 0, false);
+}
+
+test "an unmanaged client still leads by typing" {
+    const alloc = std.testing.allocator;
+    var daemon = testDaemon();
+    defer daemon.clients.deinit(alloc);
+    defer daemon.pty_write_buf.deinit(alloc);
+    daemon.leader_client_fd = 42;
+
+    const a = try lib_posix.pipe2(.{});
+    defer lib_posix.close(a[1]);
+    const stock = try testClient(alloc, a[0], true);
+    try daemon.clients.append(alloc, stock);
+    try daemon.handleInput(alloc, stock, "x");
+
+    try std.testing.expectEqual(@as(?i32, a[0]), daemon.leader_client_fd);
+    try std.testing.expectEqualStrings("x", daemon.pty_write_buf.items);
+    try std.testing.expectEqual(@as(usize, 0), queuedRoles(stock).count);
+    _ = daemon.closeClient(alloc, stock, 0, false);
+}
+
+test "typed input is encoded for the keyboard mode the program asked for" {
+    const alloc = std.testing.allocator;
+    const cfg = Cfg{ .socket_dir = "", .log_dir = "" };
+    var term = try initTerminal(alloc, std.testing.io, .{ .cols = 80, .rows = 24 }, &cfg);
+    defer term.deinit(alloc);
+    var stream = term.vtStream();
+    defer stream.deinit();
+
+    const legacy = try terminal.encodeTyped(alloc, &term, "ls -la\r\rcaf\xc3\xa9");
+    defer alloc.free(legacy);
+    try std.testing.expectEqualStrings("ls -la\r\rcaf\xc3\xa9", legacy);
+
+    // every kitty flag: Return is reported as a key, with its release
+    stream.nextSlice("\x1b[>31u");
+    const kitty = try terminal.encodeTyped(alloc, &term, "ls\r");
+    defer alloc.free(kitty);
+    try std.testing.expect(std.mem.startsWith(u8, kitty, "ls"));
+    try std.testing.expect(std.mem.indexOf(u8, kitty, "\x1b[13u") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kitty, "\x1b[13;1:3u") != null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, kitty, '\r') == null);
+}
+
+test "type queues bytes without the lead and says when the queue is full" {
+    const alloc = std.testing.allocator;
+    const cfg = Cfg{ .socket_dir = "", .log_dir = "" };
+    var term = try initTerminal(alloc, std.testing.io, .{ .cols = 80, .rows = 24 }, &cfg);
+    defer term.deinit(alloc);
+    var daemon = testDaemon();
+    defer daemon.clients.deinit(alloc);
+    defer daemon.pty_write_buf.deinit(alloc);
+    daemon.leader_client_fd = 42;
+
+    const a = try lib_posix.pipe2(.{});
+    defer lib_posix.close(a[1]);
+    const caller = try testClient(alloc, a[0], false);
+    try daemon.clients.append(alloc, caller);
+
+    try daemon.handleType(alloc, caller, &term, "\r");
+    try std.testing.expectEqualStrings("\r", daemon.pty_write_buf.items);
+    try std.testing.expectEqual(@as(?i32, 42), daemon.leader_client_fd);
+    try std.testing.expectEqual(@backingInt(ipc.TypeResult.accepted), caller.write_buf.items[caller.write_buf.items.len - 1]);
+
+    const too_much = try alloc.alloc(u8, Daemon.PTY_WRITE_BUF_MAX);
+    defer alloc.free(too_much);
+    @memset(too_much, 'x');
+    try daemon.handleType(alloc, caller, &term, too_much);
+    try std.testing.expectEqualStrings("\r", daemon.pty_write_buf.items);
+    try std.testing.expectEqual(@backingInt(ipc.TypeResult.rejected), caller.write_buf.items[caller.write_buf.items.len - 1]);
+    _ = daemon.closeClient(alloc, caller, 0, false);
+}
+
+test "screen answers with a header even for a blank screen" {
+    const alloc = std.testing.allocator;
+    const cfg = Cfg{ .socket_dir = "", .log_dir = "" };
+    var term = try initTerminal(alloc, std.testing.io, .{ .cols = 20, .rows = 5 }, &cfg);
+    defer term.deinit(alloc);
+    var stream = term.vtStream();
+    defer stream.deinit();
+    var daemon = testDaemon();
+    defer daemon.clients.deinit(alloc);
+
+    const a = try lib_posix.pipe2(.{});
+    defer lib_posix.close(a[1]);
+    const caller = try testClient(alloc, a[0], false);
+    try daemon.clients.append(alloc, caller);
+
+    try daemon.handleScreen(alloc, caller, &term, &[_]u8{@backingInt(ipc.ScreenMode.active)});
+    const blank = caller.write_buf.items[@sizeOf(ipc.Header)..];
+    try std.testing.expectEqual(@as(usize, @sizeOf(ipc.ScreenHeader)), blank.len);
+
+    // a line longer than the grid wraps on screen and reads back as one line
+    caller.write_buf.clearRetainingCapacity();
+    stream.nextSlice("0123456789abcdefghijKLMNO\r\n> ab");
+    daemon.screen_revision = 9;
+    try daemon.handleScreen(alloc, caller, &term, &[_]u8{@backingInt(ipc.ScreenMode.active)});
+    const reply = caller.write_buf.items[@sizeOf(ipc.Header)..];
+    const header = std.mem.bytesToValue(ipc.ScreenHeader, reply[0..@sizeOf(ipc.ScreenHeader)]);
+    try std.testing.expectEqual(@as(u64, 9), header.revision);
+    try std.testing.expectEqual(@as(u16, 20), header.cols);
+    try std.testing.expectEqual(@as(u16, 4), header.cursor_x);
+    try std.testing.expectEqual(@as(u16, 2), header.cursor_y);
+    try std.testing.expectEqual(@as(u8, 0), header.alternate);
+    try std.testing.expectEqualStrings("0123456789abcdefghijKLMNO\n> ab", reply[@sizeOf(ipc.ScreenHeader)..]);
+
+    // a mode this daemon does not know gets an empty reply, never a guess
+    caller.write_buf.clearRetainingCapacity();
+    try daemon.handleScreen(alloc, caller, &term, &[_]u8{200});
+    try std.testing.expectEqual(@as(usize, @sizeOf(ipc.Header)), caller.write_buf.items.len);
+    _ = daemon.closeClient(alloc, caller, 0, false);
 }
 
 test "handleEnvGet returns leader client's environment variables including unsets" {

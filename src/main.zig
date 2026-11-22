@@ -278,6 +278,28 @@ fn mainImpl(init: std.process.Init) !void {
             if (err == error.SessionUnresponsive) std.process.exit(1);
             return printError(io, "send failed: {s}", .{@errorName(err)});
         };
+    } else if (std.mem.eql(u8, cmd, "screen") or std.mem.eql(u8, cmd, "type")) {
+        var session_name: ?[]const u8 = null;
+        var mode: ipc.ScreenMode = .active;
+        while (args.next()) |arg| {
+            if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+                return help(io);
+            } else if (std.mem.eql(u8, arg, "--all")) {
+                mode = .all;
+            } else if (session_name == null) {
+                session_name = arg;
+            }
+        }
+        const raw_name = session_name orelse return printError(io, "session name required", .{});
+        const sesh = try socket.getSeshName(gpa, raw_name);
+        defer gpa.free(sesh);
+        const socket_path = socket.getSocketPath(gpa, cfg.socket_dir, sesh) catch |err| switch (err) {
+            error.NameTooLong => return socket.printSessionNameTooLong(io, sesh, cfg.socket_dir),
+            error.OutOfMemory => return err,
+        };
+        defer gpa.free(socket_path);
+        if (std.mem.eql(u8, cmd, "screen")) return screen(gpa, io, sesh, socket_path, mode);
+        return typeInto(gpa, io, sesh, socket_path);
     } else if (std.mem.eql(u8, cmd, "print") or std.mem.eql(u8, cmd, "p")) {
         const session_name = args.next() orelse "";
         if (std.mem.eql(u8, session_name, "--help") or std.mem.eql(u8, session_name, "-h")) {
@@ -468,6 +490,8 @@ fn help(io: std.Io) !void {
         \\  print-env [-s] <name> [key]                                Print tracked environment variables
         \\  [k]ill <name>... [--force]                                 Kill session and all attached clients
         \\  [hi]story <name> [--vt|--html] [--screen|--scrollback]     Output session scrollback
+        \\  screen <name> [--all]                                     Geometry and cursor on one line, then the screen text
+        \\  type <name>                                               Type stdin as keys (CR is Return) without taking the lead
         \\  [w]ait <name>...                                           Wait for session tasks to complete
         \\  [t]ail <name>...                                           Follow session output
         \\  [c]ompletions <shell>                                      Shell completions (bash, zsh, fish, nu, yash)
@@ -612,6 +636,12 @@ fn help(io: std.Io) !void {
         \\  ZMX_DIR_MODE         Sets mode for socket and log directories (octal, defaults to 0750)
         \\  ZMX_LOG_MODE         Sets mode for log files (octal, defaults to 0640)
         \\  ZMX_NO_DETACH_KEY    Disables the ctrl+\ detach shortcut (set to any value)
+        \\  ZMX_MANAGED          For a terminal that manages leadership itself: a token of letters,
+        \\                       digits and dashes. The attaching client then leads only by claiming,
+        \\                       never by typing, and reports its role to the terminal as the title
+        \\                       OSC 2;zmx-role;<token>:<unowned|leader|follower>:<generation>
+        \\  ZMX_MANAGED_CLAIM    With ZMX_MANAGED, take the lead on attach even from a live leader
+        \\                       (set to any value). Without it an attach leads only a session nobody leads
         \\
     ;
     var buf: [8192]u8 = undefined;
@@ -1200,6 +1230,59 @@ fn writeFile(gpa: std.mem.Allocator, io: std.Io, session_name: []const u8, file_
     var w = std.Io.File.stdout().writer(io, &buf);
     try w.interface.print("file created {s}\n", .{file_path});
     try w.interface.flush();
+}
+
+/// How long `screen` and `type` wait for the daemon. A daemon older than these
+/// tags ignores them, so the wait running out is how it is told apart.
+const QUERY_TIMEOUT_MS = 2000;
+
+/// Prints `revision cols rows cursor_x cursor_y alternate` on the first line,
+/// then the text. Exits nonzero on any failure, never with a partial answer.
+fn screen(alloc: std.mem.Allocator, io: std.Io, session_name: []const u8, socket_path: []const u8, mode: ipc.ScreenMode) !void {
+    const request = [_]u8{@backingInt(mode)};
+    const reply = ipc.roundTripLarge(alloc, socket_path, .Screen, &request, .Screen, QUERY_TIMEOUT_MS) catch |err| {
+        return printError(io, "screen failed for \"{s}\": {s}", .{ session_name, @errorName(err) });
+    };
+    defer alloc.free(reply);
+    if (reply.len < @sizeOf(ipc.ScreenHeader)) {
+        return printError(io, "screen failed for \"{s}\": malformed reply", .{session_name});
+    }
+    const header = std.mem.bytesToValue(ipc.ScreenHeader, reply[0..@sizeOf(ipc.ScreenHeader)]);
+
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.File.stdout().writer(io, &buf);
+    try w.interface.print("{d} {d} {d} {d} {d} {d}\n", .{
+        header.revision, header.cols,     header.rows,
+        header.cursor_x, header.cursor_y, header.alternate,
+    });
+    try w.interface.writeAll(reply[@sizeOf(ipc.ScreenHeader)..]);
+    try w.interface.flush();
+}
+
+/// Types stdin into the session as keystrokes, each CR a Return key, without
+/// taking the lead. Nothing is trimmed. Success means the daemon queued it, not
+/// that the program read it.
+fn typeInto(alloc: std.mem.Allocator, io: std.Io, session_name: []const u8, socket_path: []const u8) !void {
+    var payload = std.ArrayList(u8).empty;
+    defer payload.deinit(alloc);
+    const stdin_file = std.Io.File.stdin();
+    var stdin_buf: [4096]u8 = undefined;
+    var reader = stdin_file.reader(io, &stdin_buf);
+    while (true) {
+        var dest: [4096]u8 = undefined;
+        const n = try reader.interface.readSliceShort(&dest);
+        if (n == 0) break;
+        try payload.appendSlice(alloc, dest[0..n]);
+    }
+    if (payload.items.len == 0) return printError(io, "type reads the bytes to queue from stdin", .{});
+
+    const reply = ipc.roundTripLarge(alloc, socket_path, .Type, payload.items, .Type, QUERY_TIMEOUT_MS) catch |err| {
+        return printError(io, "type failed for \"{s}\": {s}", .{ session_name, @errorName(err) });
+    };
+    defer alloc.free(reply);
+    if (reply.len != 1 or reply[0] != @backingInt(ipc.TypeResult.accepted)) {
+        return printError(io, "type rejected by \"{s}\": input queue is full", .{session_name});
+    }
 }
 
 fn send(alloc: std.mem.Allocator, io: std.Io, session_name: []const u8, text_parts: [][]const u8, tag: ipc.Tag) !void {

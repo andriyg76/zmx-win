@@ -330,6 +330,53 @@ pub fn serializeTerminalRange(
     };
 }
 
+/// The bytes a terminal sends for `typed`, as keystrokes rather than as a paste:
+/// each carriage return is a Return key press and release, and every run between
+/// them is text a key produced. Encoded against `term`'s live keyboard mode, so
+/// a program that asked for the kitty protocol gets `CSI 13 u` where a shell gets
+/// a bare CR. Caller frees.
+pub fn encodeTyped(alloc: std.mem.Allocator, term: *const ghostty_vt.Terminal, typed: []const u8) ![]u8 {
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+    const opts = ghostty_vt.input.KeyEncodeOptions.fromTerminal(term);
+
+    var rest = typed;
+    while (rest.len > 0) {
+        const run = std.mem.indexOfScalar(u8, rest, '\r') orelse rest.len;
+        if (run > 0) try ghostty_vt.input.encodeKey(&builder.writer, .{ .utf8 = rest[0..run] }, opts);
+        if (run == rest.len) break;
+        try ghostty_vt.input.encodeKey(&builder.writer, .{ .key = .enter }, opts);
+        try ghostty_vt.input.encodeKey(&builder.writer, .{ .key = .enter, .action = .release }, opts);
+        rest = rest[run + 1 ..];
+    }
+    return alloc.dupe(u8, builder.writer.buffered());
+}
+
+/// Plain text of the active screen, or of scrollback plus the active screen,
+/// read the way a terminal copies a selection: soft-wrapped rows joined and
+/// trailing blanks trimmed. Empty for a blank screen. Caller frees.
+pub fn serializeScreenText(
+    alloc: std.mem.Allocator,
+    term: *ghostty_vt.Terminal,
+    all: bool,
+) ![]u8 {
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    const pages = &term.screens.active.pages;
+    var opts: ghostty_vt.formatter.Options = .plain;
+    opts.unwrap = true;
+    var term_formatter = ghostty_vt.formatter.TerminalFormatter.init(term, opts);
+    term_formatter.extra = .none;
+    term_formatter.content = .{ .selection = if (all) null else sel: {
+        const end = pages.getBottomRight(.active) orelse break :sel null;
+        break :sel ghostty_vt.Selection.init(pages.getTopLeft(.active), end, false);
+    } };
+
+    try term_formatter.format(&builder.writer);
+    return alloc.dupe(u8, builder.writer.buffered());
+}
+
 test "serializeTerminalState excludes synchronized output replay" {
     const alloc = testing.allocator;
     const io = testing.io;
