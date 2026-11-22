@@ -493,7 +493,7 @@ pub const ShellKind = enum {
 /// The input that follows a `zmx run` command so the shell prints `marker` and the command's exit code.
 /// POSIX shells chain it with `;`, or put it on the next line after a heredoc, whose delimiter must end its
 /// line. PowerShell chains it too, reporting $LASTEXITCODE for a failed native program and 1 for a failed
-/// cmdlet, and after a here-string goes to the next line. cmd expands %errorlevel% as it reads a line,
+/// cmdlet (the daemon zeroes $LASTEXITCODE ahead of the command), and after a here-string goes to the next line. cmd expands %errorlevel% as it reads a line,
 /// before running it, so its marker always goes on the next line.
 pub fn taskMarkerLine(buf: []u8, kind: ShellKind, marker: []const u8, cmd: []const u8) ![]u8 {
     return switch (kind) {

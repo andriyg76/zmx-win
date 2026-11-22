@@ -1633,8 +1633,11 @@ pub const Daemon = struct {
         var buf: [1024]u8 = undefined;
         const marker = try util.getTaskExitMarker(&buf, self.task_id);
         var marker_buf: [1024]u8 = undefined;
-        const marker_line = try util.taskMarkerLine(&marker_buf, util.ShellKind.of(self.sessionShell()), marker, cmd);
+        const shell_kind = util.ShellKind.of(self.sessionShell());
+        const marker_line = try util.taskMarkerLine(&marker_buf, shell_kind, marker, cmd);
 
+        // a failed cmdlet leaves $LASTEXITCODE as the last native program set it, so it starts at 0
+        if (shell_kind == .powershell) self.queuePtyInput(gpa, "$global:LASTEXITCODE = 0; ");
         if (cmd.len > 0 and cmd[cmd.len - 1] == '\r') {
             self.queuePtyInput(gpa, cmd[0 .. cmd.len - 1]);
         } else {
