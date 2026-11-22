@@ -190,6 +190,17 @@ fn mainImpl(init: std.process.Init) !void {
         const env_str = try getTrackedEnvStr(gpa, env_keys, init.environ_map);
         defer gpa.free(env_str);
 
+        if (parsed.detached) {
+            const created = zmx.create(gpa, io, parsed.session_name, .{
+                .command = command,
+                .cwd = cwd,
+                .shell = shell_env,
+                .labels = parsed.labels,
+            }) catch |err| return printError(io, "cannot create session \"{s}\": {s}", .{ parsed.session_name, @errorName(err) });
+            if (!created) return printError(io, "session \"{s}\" exists", .{parsed.session_name});
+            return;
+        }
+
         zmx.attach(gpa, io, parsed.session_name, .{
             .command = command,
             .cwd = cwd,
@@ -478,6 +489,7 @@ fn help(io: std.Io) !void {
         \\
         \\Commands:
         \\  [a]ttach [--labels kv] <name> [command...]                 Attach to session, creating if needed
+        \\  attach --detached <name> [command...]                     Create session without attaching
         \\  [r]un <name> [-d] [command...]                             Send command without attaching
         \\  [s]end <name> <text...>                                    Send raw input to session PTY
         \\  [p]rint <name> <text...>                                   Inject text into session display
@@ -1159,6 +1171,8 @@ const AttachArgs = struct {
     /// same space-separated form `zmx set` takes.
     labels: ?[]const u8 = null,
     want_help: bool = false,
+    /// `--detached`: create the session and return without attaching.
+    detached: bool = false,
     /// `--labels` was given with nothing to apply.
     missing_labels_value: bool = false,
 };
@@ -1175,6 +1189,10 @@ fn parseAttachArgs(argv: []const []const u8) AttachArgs {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             parsed.want_help = true;
             return parsed;
+        }
+        if (std.mem.eql(u8, arg, "--detached")) {
+            parsed.detached = true;
+            continue;
         }
         if (std.mem.startsWith(u8, arg, labels_flag ++ "=")) {
             parsed.labels = arg[labels_flag.len + 1 ..];

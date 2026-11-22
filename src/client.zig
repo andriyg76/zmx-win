@@ -100,7 +100,7 @@ pub fn create(alloc: Allocator, io: Io, name: []const u8, opts: CreateOptions) !
     }
 
     if (opts.labels) |kvs| {
-        try set(alloc, io, sesh, kvs);
+        try set(alloc, io, name, kvs);
     }
 
     return true;
@@ -159,7 +159,7 @@ pub fn attach(alloc: Allocator, io: Io, name: []const u8, opts: AttachOptions) !
     }
 
     if (opts.labels) |kvs| {
-        try set(alloc, io, sesh, kvs);
+        try set(alloc, io, name, kvs);
     }
 
     const client_sock = try socket.sessionConnect(socket_path);

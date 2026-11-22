@@ -7,6 +7,7 @@ const socket = @import("socket.zig");
 const label = @import("label.zig");
 const role = @import("role.zig");
 const lib_posix = @import("posix.zig");
+const exit_record = @import("exit_record.zig");
 const Cfg = @import("cfg.zig");
 const signal = @import("signal.zig");
 const assert = std.debug.assert;
@@ -381,6 +382,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                     // Let the rest of this poll iteration complete so client
                     // write buffers are flushed via the normal POLLOUT path.
                     // On the next iteration, daemon.running will be false.
+                    daemon.child_exited = true;
                     daemon.running = false;
                 } else {
                     // Feed PTY output to terminal emulator for state tracking
@@ -638,6 +640,8 @@ pub const Daemon = struct {
     /// bumped on every pty read, resize and injected output, carried in each ScreenHeader
     screen_revision: u64 = 0,
     running: bool = true,
+    /// set when the pty reached EOF because the shell exited, as opposed to a kill
+    child_exited: bool = false,
     pid: i32 = undefined,
     command: ?[]const []const u8 = null,
     /// The session's working directory in OSC 7 form, `file://<host><path>`.
@@ -885,6 +889,10 @@ pub const Daemon = struct {
         };
 
         defer {
+            // a shell that exited is recorded before the socket goes, so a
+            // supervisor that finds the session gone without a record knows
+            // it was killed rather than exited
+            if (self.child_exited) exit_record.write();
             // Close and unlink the listen socket BEFORE handleKill()'s
             // 500ms SIGHUP->SIGKILL grace sleep. Otherwise a `zmx run`
             // for the same name issued in that window will hang waiting

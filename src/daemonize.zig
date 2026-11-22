@@ -85,6 +85,8 @@ fn exec(sesh_name: []const u8, cmd: Cmd) !noreturn {
     // it must not opt in on the outer terminal's behalf or learn its nonce
     _ = cross.unsetenv("ZMX_MANAGED");
     _ = cross.unsetenv("ZMX_MANAGED_CLAIM");
+    // the record is the daemon's to write; a nested session must not write its own exit into it
+    _ = cross.unsetenv("ZMX_EXIT_FILE");
 
     const err = lib_posix.execvpeZ(cmd.file, cmd.argv_ptr, std.c.environ);
     std.log.err("execvpe failed: cmd={s} err={s}", .{ cmd.file, @errorName(err) });
