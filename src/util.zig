@@ -166,7 +166,7 @@ pub fn parseOsc7Cwd(buf: []u8, value: []const u8, hostname: []const u8) ?Cwd {
         break :blk buf[0..decoded.len];
     };
 
-    return .{ .path = path, .is_local = isLocalHost(uri.host, hostname) };
+    return .{ .path = if (is_windows) windowsPathFromUri(buf[0..path.len]) else path, .is_local = isLocalHost(uri.host, hostname) };
 }
 
 fn isLocalHost(host: ?std.Uri.Component, hostname: []const u8) bool {
@@ -195,10 +195,51 @@ fn isLocalHost(host: ?std.Uri.Component, hostname: []const u8) bool {
 pub fn toOsc7Cwd(buf: []u8, path: []const u8, hostname: []const u8) ?[]const u8 {
     var w: std.Io.Writer = .fixed(buf);
     w.print("file://{s}", .{hostname}) catch return null;
+    // A Windows path takes the URI form Windows terminals use, `file://<host>/C:/dir`.
+    var win_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const uri_path = if (is_windows) windowsPathToUri(&win_buf, path) orelse return null else path;
     // Percent-encode so a path with a space or a `%` in it round-trips back
     // through parseOsc7Cwd unchanged.
-    std.Uri.Component.percentEncode(&w, path, isPathChar) catch return null;
+    std.Uri.Component.percentEncode(&w, uri_path, isPathChar) catch return null;
     return w.buffered();
+}
+
+const is_windows = @import("builtin").os.tag == .windows;
+
+/// `C:\dir` as a URI path, `/C:/dir`; a path with no drive letter only has its separators turned.
+fn windowsPathToUri(buf: []u8, path: []const u8) ?[]const u8 {
+    const drive = path.len >= 2 and std.ascii.isAlphabetic(path[0]) and path[1] == ':';
+    const len = path.len + @intFromBool(drive);
+    if (len > buf.len) return null;
+    if (drive) buf[0] = '/';
+    @memcpy(buf[@intFromBool(drive)..len], path);
+    std.mem.replaceScalar(u8, buf[0..len], '\\', '/');
+    return buf[0..len];
+}
+
+/// A URI path back as a Windows one, in place: `/C:/dir` becomes `C:\dir`.
+fn windowsPathFromUri(path: []u8) []u8 {
+    var p = path;
+    if (p.len >= 3 and p[0] == '/' and std.ascii.isAlphabetic(p[1]) and p[2] == ':') p = p[1..];
+    std.mem.replaceScalar(u8, p, '/', '\\');
+    return p;
+}
+
+test "a Windows cwd round-trips through the URI form Windows terminals use" {
+    var buf: [256]u8 = undefined;
+    const uri = windowsPathToUri(&buf, "C:\\Users\\andri") orelse return error.TooLong;
+    try std.testing.expectEqualStrings("/C:/Users/andri", uri);
+    var back: [32]u8 = undefined;
+    @memcpy(back[0..uri.len], uri);
+    try std.testing.expectEqualStrings("C:\\Users\\andri", windowsPathFromUri(back[0..uri.len]));
+    if (!is_windows) return;
+    var out: [256]u8 = undefined;
+    const osc7 = toOsc7Cwd(&out, "C:\\Users\\andri\\My Dir", "valge-cast") orelse return error.TooLong;
+    try std.testing.expectEqualStrings("file://valge-cast/C:/Users/andri/My%20Dir", osc7);
+    var path_buf: [256]u8 = undefined;
+    const cwd = parseOsc7Cwd(&path_buf, osc7, "VALGE-CAST") orelse return error.NoCwd;
+    try std.testing.expectEqualStrings("C:\\Users\\andri\\My Dir", cwd.path);
+    try std.testing.expect(cwd.is_local);
 }
 
 /// Characters that need no escaping in a URI path. RFC 3986 pchar, minus the
