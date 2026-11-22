@@ -1,7 +1,7 @@
 const std = @import("std");
 const cross = @import("cross");
 const socket = @import("socket.zig");
-const lib_posix = @import("posix.zig");
+const lib_posix = @import("sys.zig").posix;
 
 pub const PROTOCOL_VERSION: u8 = 1;
 

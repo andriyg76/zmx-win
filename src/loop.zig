@@ -6,7 +6,7 @@ const cross = @import("cross");
 const socket = @import("socket.zig");
 const label = @import("label.zig");
 const role = @import("role.zig");
-const lib_posix = @import("posix.zig");
+const lib_posix = @import("sys.zig").posix;
 const exit_record = @import("exit_record.zig");
 const Cfg = @import("cfg.zig");
 const signal = @import("signal.zig");
@@ -23,7 +23,8 @@ const CLOSE_BUDGET_MS: i64 = 2000;
 const RESET_SHARE_MS: i64 = 200;
 
 fn resetShare(stdout_fd: i32) i64 {
-    return if (std.c.isatty(stdout_fd) == 1) RESET_SHARE_MS else 0;
+    const tty = if (builtin.os.tag == .windows) lib_posix.isatty(stdout_fd) else std.c.isatty(stdout_fd) == 1;
+    return if (tty) RESET_SHARE_MS else 0;
 }
 
 /// clientLoop sends ipc commands to its corresponding daemon.  It uses poll() as its non-blocking
@@ -322,6 +323,7 @@ fn takenBy(fd: i32, deadline_ms: i64, comptime queued: fn (i32) usize) bool {
 }
 
 fn sleepMs(ms: u64) void {
+    if (builtin.os.tag == .windows) return lib_posix.sleepMs(ms);
     const ts = std.c.timespec{ .sec = 0, .nsec = @intCast(ms * std.time.ns_per_ms) };
     _ = std.c.nanosleep(&ts, null);
 }
@@ -1003,10 +1005,13 @@ pub const Daemon = struct {
 
     fn run(self: *Daemon, io: std.Io, dir: std.Io.Dir, sesh_name: []const u8) !bool {
         std.log.info("creating session={s}", .{sesh_name});
-        const server_sock_fd: lib_posix.socket_t = try socket.createSocket(self.socket_path);
-        const log_fd = if (log.log_system.file) |f| f.handle else -1;
+        // a Windows client starts the daemon as its own process, which creates the socket itself
+        const win_client = builtin.os.tag == .windows and daemonize.win.child == null;
+        if (win_client) daemonize.win.task_mode = self.is_task_mode;
+        const server_sock_fd: lib_posix.socket_t = if (win_client) -1 else try socket.createSocket(self.socket_path);
+        const log_fd = if (builtin.os.tag == .windows) -1 else if (log.log_system.file) |f| f.handle else -1;
 
-        var keep_fds_open = [_]i32{ server_sock_fd, dir.handle, log_fd };
+        var keep_fds_open = [_]i32{ server_sock_fd, if (builtin.os.tag == .windows) -1 else dir.handle, log_fd };
         const cmd = try daemonize.createCmdZ(self.shell, self.is_task_mode, self.command);
 
         // `cwd_path` is the decoded path, and is empty when the cwd is on
@@ -1044,7 +1049,8 @@ pub const Daemon = struct {
                 },
                 else => {
                     lib_posix.close(server_sock_fd);
-                    dir.deleteFile(io, self.session_name) catch {};
+                    // the socket is the daemon's when the client did not create it
+                    if (!win_client) dir.deleteFile(io, self.session_name) catch {};
                     return err;
                 },
             }
@@ -1076,7 +1082,7 @@ pub const Daemon = struct {
                 fba.allocator(),
                 &.{ self.cfg.log_dir, session_log_name },
             );
-            const log_mode = std.Io.File.Permissions.fromMode(@intCast(self.cfg.log_mode));
+            const log_mode = @import("sys.zig").permissions(self.cfg.log_mode);
             log.log_system.init(new_io, session_log_path, log_mode) catch {};
         }
 
@@ -1648,8 +1654,8 @@ pub const Daemon = struct {
     /// The value is copied, so callers may pass a temporary.
     pub fn setCwd(self: *Daemon, value: []const u8) void {
         var buf: [std.fs.max_path_bytes]u8 = undefined;
-        var host_buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
-        const hostname = std.posix.gethostname(&host_buf) catch "";
+        var host_buf: [@import("sys.zig").HOST_NAME_MAX]u8 = undefined;
+        const hostname = @import("sys.zig").gethostname(&host_buf) catch "";
         const cwd = util.parseOsc7Cwd(&buf, value, hostname) orelse {
             std.log.warn("ignoring unusable cwd={s}", .{value});
             return;

@@ -8,9 +8,11 @@ const completions = @import("completions.zig");
 const util = @import("util.zig");
 const socket = @import("socket.zig");
 const label = @import("label.zig");
-const lib_posix = @import("posix.zig");
+const lib_posix = @import("sys.zig").posix;
 const signal = @import("signal.zig");
 const Cfg = @import("cfg.zig");
+const loop = @import("loop.zig");
+const builtin = @import("builtin");
 const version = build_options.version;
 const ghostty_version = build_options.ghostty_version;
 
@@ -18,6 +20,11 @@ pub const std_options: std.Options = .{
     .logFn = log.zmxLogFn,
     .log_level = .debug,
 };
+
+comptime {
+    // the C names win/cshim.h declares are exported from Zig
+    if (builtin.os.tag == .windows) _ = @import("win/cshim.zig");
+}
 
 fn detectHelp(arg: []const u8) bool {
     return (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h"));
@@ -50,7 +57,7 @@ fn mainImpl(init: std.process.Init) !void {
     // covers the daemon.
     signal.ignoreSigpipe();
 
-    var args = init.minimal.args.iterate();
+    var args = try init.minimal.args.iterateAllocator(gpa);
     defer args.deinit();
     _ = args.next(); // skip program name
 
@@ -59,15 +66,17 @@ fn mainImpl(init: std.process.Init) !void {
 
     const log_path = try std.fs.path.join(gpa, &.{ cfg.log_dir, "zmx.log" });
     defer gpa.free(log_path);
-    const log_mode = std.Io.File.Permissions.fromMode(@intCast(cfg.log_mode));
+    const log_mode = @import("sys.zig").permissions(cfg.log_mode);
     try log.log_system.init(io, log_path, log_mode);
     defer log.log_system.deinit();
 
-    const shell_env = init.environ_map.get("SHELL") orelse "/bin/sh";
+    const shell_env = init.environ_map.get("SHELL") orelse defaultShell(gpa);
 
     const cmd = args.next() orelse {
         return list(gpa, io, &cfg, false);
     };
+
+    if (builtin.os.tag == .windows and std.mem.eql(u8, cmd, "__daemon")) return windowsDaemon(gpa, io, &cfg, &args);
 
     if (std.mem.eql(u8, cmd, "version") or std.mem.eql(u8, cmd, "v") or std.mem.eql(u8, cmd, "-v") or std.mem.eql(u8, cmd, "--version")) {
         return printVersion(io, &cfg);
@@ -1457,4 +1466,45 @@ test "EnvIterator parses set and unset entries correctly" {
     try std.testing.expectEqualStrings("/tmp/ssh.sock", e3.value.?);
 
     try std.testing.expect(it.next() == null);
+}
+
+/// The shell a session starts when SHELL is unset: /bin/sh, or on Windows PowerShell, else cmd.exe.
+fn defaultShell(gpa: std.mem.Allocator) []const u8 {
+    if (builtin.os.tag != .windows) return "/bin/sh";
+    var buf: [1024]u16 = undefined;
+    const n = SearchPathW(null, std.unicode.utf8ToUtf16LeStringLiteral("powershell.exe"), null, buf.len, &buf, null);
+    if (n > 0 and n < buf.len) {
+        if (std.unicode.wtf16LeToWtf8Alloc(gpa, buf[0..n])) |path| return path else |_| {}
+    }
+    return lib_posix.getenv("ComSpec") orelse "cmd.exe";
+}
+extern "kernel32" fn SearchPathW(path: ?[*:0]const u16, file: [*:0]const u16, ext: ?[*:0]const u16, n: u32, buf: [*]u16, part: ?*?[*:0]u16) callconv(.winapi) u32;
+
+/// `zmx __daemon NAME ROWS COLS task|session -- ARGV...`, which a Windows client runs in place of forking:
+/// it creates the session NAME running ARGV in a pseudo console of ROWS x COLS and serves it until it ends.
+fn windowsDaemon(gpa: std.mem.Allocator, io: std.Io, cfg: *Cfg, args: anytype) !void {
+    const daemonize = @import("daemonize.zig");
+    const sesh = args.next() orelse return error.InvalidArgs;
+    const rows = std.fmt.parseInt(u16, args.next() orelse return error.InvalidArgs, 10) catch return error.InvalidArgs;
+    const cols = std.fmt.parseInt(u16, args.next() orelse return error.InvalidArgs, 10) catch return error.InvalidArgs;
+    const mode = args.next() orelse return error.InvalidArgs;
+    if (!std.mem.eql(u8, args.next() orelse "", "--")) return error.InvalidArgs;
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(gpa);
+    while (args.next()) |a| try argv.append(gpa, try gpa.dupe(u8, a));
+    if (argv.items.len == 0) return error.InvalidArgs;
+
+    const socket_path = try socket.getSocketPath(gpa, cfg.socket_dir, sesh);
+    defer gpa.free(socket_path);
+    daemonize.win.child = .{ .rows = rows, .cols = cols };
+    var daemon = loop.Daemon.init(io, cfg, sesh, socket_path);
+    daemon.command = argv.items;
+    daemon.is_task_mode = std.mem.eql(u8, mode, "task");
+    daemon.quiet = true;
+    _ = daemon.ensureSession(io) catch |err| {
+        std.log.err("daemon failed session={s} err={s}", .{ sesh, @errorName(err) });
+        if (err == error.AddressInUse) std.process.exit(daemonize.win.exit_address_in_use);
+        std.process.exit(1);
+    };
+    std.process.exit(0);
 }

@@ -1,5 +1,4 @@
 const std = @import("std");
-const cross = @import("cross");
 
 pub var log_system = LogSystem{};
 
@@ -19,7 +18,7 @@ pub const LogSystem = struct {
     max_size: u64 = 2 * 1024 * 1024, // 2MB
     path: []const u8 = "",
     io: std.Io = undefined,
-    mode: std.Io.File.Permissions = std.Io.File.Permissions.fromMode(0o640),
+    mode: std.Io.File.Permissions = @import("sys.zig").permissions(0o640),
 
     pub fn init(self: *LogSystem, io: std.Io, path: []const u8, mode: std.Io.File.Permissions) !void {
         self.io = io;
@@ -40,12 +39,11 @@ pub const LogSystem = struct {
         // between our length() check and seekTo(), causing us to overwrite
         // recent parent entries. lseek(fd, 0, SEEK_END) is atomic — it
         // always positions at the true end of file at seek time.
-        const new_pos = cross.lseek(file.handle, 0, cross.SEEK_END);
-        if (new_pos == -1) {
+        const new_pos = @import("sys.zig").seekEnd(file) orelse {
             std.Io.File.close(file, self.io);
             return error.SeekFailed;
-        }
-        self.current_size = @as(u64, @intCast(new_pos));
+        };
+        self.current_size = new_pos;
         self.file = file;
     }
 

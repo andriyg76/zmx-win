@@ -1,5 +1,6 @@
 const std = @import("std");
-const lib_posix = @import("posix.zig");
+const lib_posix = @import("sys.zig").posix;
+const is_windows = @import("builtin").os.tag == .windows;
 
 /// Self-pipe woken by signal handlers. std.posix.poll loops on .INTR internally
 /// (PollError has no Interrupted member), so a signal that lands during poll()
@@ -7,6 +8,11 @@ const lib_posix = @import("posix.zig");
 pub var sig_pipe: [2]lib_posix.fd_t = .{ -1, -1 };
 
 pub fn wakeSignalPipe(sig: lib_posix.SIG, _: *const lib_posix.siginfo_t, _: ?*anyopaque) callconv(.c) void {
+    if (is_windows) {
+        // raised on a console thread rather than in a signal handler
+        _ = lib_posix.write(sig_pipe[1], &[_]u8{@intCast(@backingInt(sig))}) catch {};
+        return;
+    }
     const saved = std.c._errno().*;
     const byte = [_]u8{@intCast(@backingInt(sig))};
     _ = std.c.write(sig_pipe[1], &byte, 1);
@@ -62,6 +68,7 @@ pub fn drainSignalPipe() error{ Sighup, Sigint, Sigterm }!void {
 }
 
 pub fn reraise(sig: lib_posix.SIG) noreturn {
+    if (is_windows) std.process.exit(128 + @as(u8, @intCast(@backingInt(sig))));
     const act: lib_posix.Sigaction = .{
         .handler = .{ .handler = lib_posix.SIG.DFL },
         .mask = lib_posix.sigemptyset(),

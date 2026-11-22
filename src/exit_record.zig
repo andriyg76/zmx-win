@@ -1,5 +1,5 @@
 const std = @import("std");
-const lib_posix = @import("posix.zig");
+const lib_posix = @import("sys.zig").posix;
 
 /// Marks that the session's shell exited by writing `exited` to `ZMX_EXIT_FILE`,
 /// through a sibling that is renamed into place so a reader never sees a partial

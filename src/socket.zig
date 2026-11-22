@@ -1,5 +1,5 @@
 const std = @import("std");
-const lib_posix = @import("posix.zig");
+const lib_posix = @import("sys.zig").posix;
 
 pub fn getSeshPrefix() []const u8 {
     return lib_posix.getenv("ZMX_SESSION_PREFIX") orelse "";
@@ -86,13 +86,15 @@ pub fn cleanupStaleSocket(io: std.Io, dir: std.Io.Dir, session_name: []const u8)
 }
 
 pub fn sessionExists(io: std.Io, dir: std.Io.Dir, name: []const u8) !bool {
-    const stat = dir.statFile(io, name, std.Io.Dir.StatFileOptions{}) catch |err| {
+    // Windows cannot open a socket's reparse point to follow it
+    const stat = dir.statFile(io, name, .{ .follow_symlinks = @import("builtin").os.tag != .windows }) catch |err| {
         switch (err) {
             error.FileNotFound => return false,
             else => return err,
         }
     };
-    if (stat.kind != .unix_domain_socket) {
+    // Windows reports a socket as a reparse point, which stat gives no kind of its own
+    if (stat.kind != .unix_domain_socket and !(@import("builtin").os.tag == .windows and stat.kind != .directory)) {
         return error.FileNotUnixSocket;
     }
     return true;
@@ -139,7 +141,7 @@ fn bindStaged(sesh: []const u8) !Staged {
     var dir_buf: [max_socket_path_len + 1]u8 = undefined;
     const holder = std.mem.printSentinel(&dir_buf, "{s}/{s}", .{ dir, staging_dir }, 0) catch null;
     if (holder != null and lib_posix.ensureDir(holder.?, 0o700)) {
-        if (std.mem.printSentinel(&staged.buf, "{s}/{d}", .{ holder.?, std.c.getpid() }, 0)) |name| {
+        if (std.mem.printSentinel(&staged.buf, "{s}/{d}", .{ holder.?, @import("sys.zig").getpid() }, 0)) |name| {
             staged.len = name.len;
             // a creator that died between bind and publish left its name behind; this pid owns it now
             lib_posix.unlink(staged.path());

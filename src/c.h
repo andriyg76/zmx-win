@@ -1,6 +1,10 @@
 #ifndef MY_C_H
 #define MY_C_H
 
+#if defined(_WIN32)
+  #include "win/cshim.h"
+#else
+
 #include <stdlib.h>
 #include <unistd.h>
 #include <termios.h>
@@ -26,5 +30,7 @@
   #include <pty.h>
 
 #endif
+
+#endif // _WIN32
 
 #endif // MY_C_H

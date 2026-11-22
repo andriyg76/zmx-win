@@ -7,7 +7,7 @@
 const std = @import("std");
 const ghostty_vt = @import("ghostty-vt");
 const ipc = @import("ipc.zig");
-const lib_posix = @import("posix.zig");
+const lib_posix = @import("sys.zig").posix;
 
 /// How long a role may wait for a safe place in the output before one is forced.
 pub const DEADLINE_MS: i64 = 250;
@@ -136,6 +136,7 @@ pub const Relay = struct {
 };
 
 pub fn nowMs() i64 {
+    if (@import("builtin").os.tag == .windows) return @intCast(@import("win/api.zig").GetTickCount64());
     var ts: std.c.timespec = undefined;
     _ = std.c.clock_gettime(.MONOTONIC, &ts);
     return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), std.time.ns_per_ms);

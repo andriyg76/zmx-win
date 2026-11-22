@@ -4,7 +4,7 @@
 pub const Cfg = @This();
 
 const std = @import("std");
-const lib_posix = @import("posix.zig");
+const lib_posix = @import("sys.zig").posix;
 const cross = @import("cross");
 
 socket_dir: []const u8,
@@ -42,7 +42,8 @@ pub fn init(alloc: std.mem.Allocator, io: std.Io) !Cfg {
     return cfg;
 }
 
-fn socketDir(alloc: std.mem.Allocator) ![]const u8 {
+pub fn socketDir(alloc: std.mem.Allocator) ![]const u8 {
+    if (@import("builtin").os.tag == .windows) return windowsDir(alloc, "TEMP", "zmx-{s}", .{windowsUser()});
     const tmpdir = std.mem.trimEnd(u8, lib_posix.getenv("TMPDIR") orelse "/tmp", "/");
     const uid = lib_posix.getuid();
 
@@ -57,6 +58,7 @@ fn socketDir(alloc: std.mem.Allocator) ![]const u8 {
 }
 
 fn logDir(alloc: std.mem.Allocator) ![]const u8 {
+    if (@import("builtin").os.tag == .windows) return windowsDir(alloc, "LOCALAPPDATA", "zmx/logs", .{});
     const log_dir = if (lib_posix.getenv("ZMX_DIR")) |zmxdir|
         try std.fmt.allocPrint(alloc, "{s}/logs", .{zmxdir})
     else if (lib_posix.getenv("XDG_STATE_HOME")) |xdg_state_home|
@@ -73,15 +75,34 @@ fn logDir(alloc: std.mem.Allocator) ![]const u8 {
     return log_dir;
 }
 
+/// ZMX_DIR as on POSIX, or the directory `fmt` names under the one `base_env` names, with forward slashes:
+/// zmx joins paths with them, and Windows reads either.
+fn windowsDir(alloc: std.mem.Allocator, comptime base_env: []const u8, comptime fmt: []const u8, args: anytype) ![]const u8 {
+    if (lib_posix.getenv("ZMX_DIR")) |zmxdir| {
+        return if (std.mem.eql(u8, fmt, "zmx/logs"))
+            std.fmt.allocPrint(alloc, "{s}/logs", .{zmxdir})
+        else
+            alloc.dupe(u8, zmxdir);
+    }
+    const base = std.mem.trimEnd(u8, lib_posix.getenv(base_env) orelse "C:/Windows/Temp", "/\\");
+    const dir = try std.fmt.allocPrint(alloc, "{s}/" ++ fmt, .{base} ++ args);
+    std.mem.replaceScalar(u8, dir, '\\', '/');
+    return dir;
+}
+
+fn windowsUser() []const u8 {
+    return lib_posix.getenv("USERNAME") orelse "user";
+}
+
 pub fn deinit(self: *Cfg, alloc: std.mem.Allocator) void {
     if (self.socket_dir.len > 0) alloc.free(self.socket_dir);
     if (self.log_dir.len > 0) alloc.free(self.log_dir);
 }
 
 pub fn mkdir(self: *Cfg, io: std.Io) !void {
-    const sock_perms = std.Io.Dir.Permissions.fromMode(@intCast(self.dir_mode));
+    const sock_perms = @import("sys.zig").permissions(self.dir_mode);
     try mkdirAll(io, self.socket_dir, sock_perms);
-    const log_perms = std.Io.Dir.Permissions.fromMode(@intCast(self.dir_mode));
+    const log_perms = @import("sys.zig").permissions(self.dir_mode);
     try mkdirAll(io, self.log_dir, log_perms);
 }
 
@@ -158,6 +179,6 @@ test "mkdirAll fails on dangling symlink instead of looping" {
     const target_path = try std.fs.path.join(alloc, &.{ tmp_path, "broken_link", "sub" });
     defer alloc.free(target_path);
 
-    const perms = std.Io.Dir.Permissions.fromMode(0o750);
+    const perms = @import("sys.zig").permissions(0o750);
     try std.testing.expectError(error.NotDir, mkdirAll(std.testing.io, target_path, perms));
 }

@@ -10,7 +10,7 @@ const ipc = @import("ipc.zig");
 const socket = @import("socket.zig");
 const cross = @import("cross");
 const label = @import("label.zig");
-const lib_posix = @import("posix.zig");
+const lib_posix = @import("sys.zig").posix;
 const testing = std.testing;
 
 pub const SessionEntry = struct {
@@ -172,7 +172,7 @@ pub fn parseOsc7Cwd(buf: []u8, value: []const u8, hostname: []const u8) ?Cwd {
 fn isLocalHost(host: ?std.Uri.Component, hostname: []const u8) bool {
     // file:///path omits the host, which conventionally means the local machine.
     const component = host orelse return true;
-    var host_buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
+    var host_buf: [@import("sys.zig").HOST_NAME_MAX]u8 = undefined;
     const value = component.toRaw(&host_buf) catch return false;
     if (value.len == 0) return true;
     if (std.ascii.eqlIgnoreCase(value, "localhost")) return true;
@@ -217,8 +217,8 @@ pub fn getCwd(gpa: std.mem.Allocator, io: std.Io) ![]u8 {
     const cur_path = try std.process.currentPathAlloc(io, gpa);
     defer gpa.free(cur_path);
 
-    var buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
-    const hostname = try std.posix.gethostname(&buf);
+    var buf: [@import("sys.zig").HOST_NAME_MAX]u8 = undefined;
+    const hostname = try @import("sys.zig").gethostname(&buf);
 
     return std.fmt.allocPrint(gpa, "file://{s}{s}", .{ hostname, cur_path });
 }

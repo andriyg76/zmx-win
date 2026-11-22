@@ -1,11 +1,13 @@
 const std = @import("std");
-const lib_posix = @import("posix.zig");
+const lib_posix = @import("sys.zig").posix;
 const Cfg = @import("cfg.zig");
 const socket = @import("socket.zig");
 const ipc = @import("ipc.zig");
 const assert = std.debug.assert;
 const log = @import("log.zig");
 const cross = @import("cross");
+const builtin = @import("builtin");
+const is_windows = builtin.os.tag == .windows;
 
 const Cmd = struct {
     file: [*:0]const u8,
@@ -29,10 +31,17 @@ pub fn createCmdZ(def_shell: []const u8, is_task_mode: bool, command: ?[]const [
         }
     }
 
-    const shell: [:0]const u8 = if (is_task_mode)
+    const shell: [:0]const u8 = if (is_task_mode and !is_windows)
         "bash"
     else
         try gpa.dupeSentinel(u8, def_shell, 0);
+
+    if (is_windows) {
+        // Windows shells have no login-shell convention to signal through argv[0]
+        const argv = try gpa.allocSentinel(?[*:0]const u8, 1, null);
+        argv[0] = shell.ptr;
+        return .{ .file = shell, .argv_ptr = argv.ptr };
+    }
 
     // Use "-shellname" as argv[0] to signal login shell (traditional method)
     const login_shell = try std.fmt.allocPrintSentinel(
@@ -104,6 +113,7 @@ pub const PtyInfo = struct {
 /// This is the second fork in the double-fork technique explained in the
 /// daemonize() comment.
 pub fn spawnPty(sesh_name: []const u8, cmd: Cmd, size: ipc.Resize) !PtyInfo {
+    if (is_windows) return win.spawnConsole(sesh_name, cmd, size);
     var ws: cross.struct_winsize = .{
         .ws_row = size.rows,
         .ws_col = size.cols,
@@ -185,6 +195,7 @@ pub fn spawnPty(sesh_name: []const u8, cmd: Cmd, size: ipc.Resize) !PtyInfo {
 ///                            ▼
 ///                          DAEMON ✓
 pub fn daemonize(sesh_name: []const u8, cmd: Cmd, keep_fds_open: []i32) !PtyInfo {
+    if (is_windows) return win.daemonize(sesh_name, cmd);
     // creates the daemon
     const pid = try lib_posix.fork();
     assert(pid != -1);
@@ -254,3 +265,118 @@ pub fn daemonize(sesh_name: []const u8, cmd: Cmd, keep_fds_open: []i32) !PtyInfo
 
     return spawnPty(sesh_name, cmd, term_size);
 }
+
+/// Windows has no fork, so a client starts the daemon as `zmx __daemon`, a fresh process given the session,
+/// the size and the command the fork would have carried over, and waits until its socket answers.
+pub const win = struct {
+    const api = @import("win/api.zig");
+    const conpty = @import("win/conpty.zig");
+
+    pub const Child = struct { rows: u16, cols: u16 };
+    /// set in the `zmx __daemon` process, which runs the daemon itself
+    pub var child: ?Child = null;
+    /// whether the client is starting a `zmx run` task session, carried to the daemon
+    pub var task_mode = false;
+
+    /// The exit code of a `zmx __daemon` that lost the race for its session's socket.
+    pub const exit_address_in_use: u8 = 3;
+
+    pub fn daemonize(sesh_name: []const u8, cmd: Cmd) !PtyInfo {
+        if (child) |c| return spawnConsole(sesh_name, cmd, .{ .rows = c.rows, .cols = c.cols });
+        try startDaemon(sesh_name, cmd);
+        return error.IsClientProc;
+    }
+
+    fn startDaemon(sesh_name: []const u8, cmd: Cmd) !void {
+        const gpa = std.heap.c_allocator;
+        const size = ipc.getTerminalSize(lib_posix.STDOUT_FILENO);
+
+        var exe_buf: [1024]u16 = undefined;
+        const exe_len = api.GetModuleFileNameW(null, &exe_buf, exe_buf.len);
+        if (exe_len == 0 or exe_len >= exe_buf.len) return error.NoExePath;
+        const exe = try std.unicode.wtf16LeToWtf8Alloc(gpa, exe_buf[0..exe_len]);
+        defer gpa.free(exe);
+
+        var args: std.ArrayList([]const u8) = .empty;
+        defer args.deinit(gpa);
+        var rows_buf: [8]u8 = undefined;
+        var cols_buf: [8]u8 = undefined;
+        try args.appendSlice(gpa, &.{
+            exe,
+            "__daemon",
+            sesh_name,
+            try std.fmt.bufPrint(&rows_buf, "{d}", .{size.rows}),
+            try std.fmt.bufPrint(&cols_buf, "{d}", .{size.cols}),
+            if (task_mode) "task" else "session",
+            "--",
+        });
+        var i: usize = 0;
+        while (cmd.argv_ptr[i]) |arg| : (i += 1) try args.append(gpa, std.mem.span(arg));
+
+        const cmdline = try conpty.commandLine(gpa, args.items);
+        defer gpa.free(cmdline);
+
+        var si: api.STARTUPINFOW = .{ .cb = @sizeOf(api.STARTUPINFOW) };
+        // the daemon keeps none of the client's stdio, so a pipe on it reaches EOF when the client exits
+        si.dwFlags = api.STARTF_USESTDHANDLES;
+        si.hStdInput = api.INVALID_HANDLE_VALUE;
+        si.hStdOutput = api.INVALID_HANDLE_VALUE;
+        si.hStdError = api.INVALID_HANDLE_VALUE;
+        var pi: api.PROCESS_INFORMATION = undefined;
+        const base = api.DETACHED_PROCESS | api.CREATE_NEW_PROCESS_GROUP | api.CREATE_NO_WINDOW;
+        // leave the client's job when it allows that, so closing the client's terminal does not end the daemon
+        if (api.CreateProcessW(null, cmdline.ptr, null, null, 0, base | api.CREATE_BREAKAWAY_FROM_JOB, null, null, &si, &pi) == 0) {
+            const first = api.GetLastError();
+            if (api.CreateProcessW(null, cmdline.ptr, null, null, 0, base, null, null, &si, &pi) == 0) {
+                std.log.err("starting daemon failed err={d} breakaway_err={d}", .{ api.GetLastError(), first });
+                return error.DaemonSpawnFailed;
+            }
+            std.log.warn("daemon started inside the client's job err={d}", .{first});
+        }
+        _ = api.CloseHandle(pi.hThread);
+        defer _ = api.CloseHandle(pi.hProcess);
+        std.log.info("daemon process started session={s} pid={d}", .{ sesh_name, pi.dwProcessId });
+
+        const socket_path = try socket.getSocketPath(gpa, (try Cfg.socketDir(gpa)), sesh_name);
+        defer gpa.free(socket_path);
+        const deadline = api.GetTickCount64() + 10_000;
+        while (api.GetTickCount64() < deadline) {
+            if (socket.sessionConnect(socket_path)) |fd| {
+                lib_posix.close(fd);
+                return;
+            } else |_| {}
+            if (api.WaitForSingleObject(pi.hProcess, 20) == api.WAIT_OBJECT_0) {
+                var code: u32 = 0;
+                _ = api.GetExitCodeProcess(pi.hProcess, &code);
+                std.log.info("daemon process exited before its socket answered code={d}", .{code});
+                if (code == exit_address_in_use) return error.AddressInUse;
+                // a daemon that found the session running already left it to this client
+                if (code == 0) return;
+                return error.DaemonSpawnFailed;
+            }
+        }
+        return error.DaemonStartTimeout;
+    }
+
+    pub fn spawnConsole(sesh_name: []const u8, cmd: Cmd, size: ipc.Resize) !PtyInfo {
+        const gpa = std.heap.c_allocator;
+        const session_env = try std.fmt.allocPrintSentinel(gpa, "ZMX_SESSION={s}", .{sesh_name}, 0);
+        _ = cross.putenv(session_env.ptr);
+        if (cross.getenv("TERM")) |term_env| {
+            if (std.mem.eql(u8, std.mem.span(term_env), "dumb")) _ = cross.putenv(@constCast("TERM=xterm-256color"));
+        } else {
+            _ = cross.putenv(@constCast("TERM=xterm-256color"));
+        }
+        _ = cross.unsetenv("ZMX_MANAGED");
+        _ = cross.unsetenv("ZMX_MANAGED_CLAIM");
+        _ = cross.unsetenv("ZMX_EXIT_FILE");
+
+        var argv: std.ArrayList([]const u8) = .empty;
+        defer argv.deinit(gpa);
+        var i: usize = 0;
+        while (cmd.argv_ptr[i]) |arg| : (i += 1) try argv.append(gpa, std.mem.span(arg));
+        const spawned = try conpty.spawn(argv.items, size.rows, size.cols);
+        std.log.info("pty spawned session={s} pid={d}", .{ sesh_name, spawned.pid });
+        return .{ .master_fd = spawned.fd, .pid = spawned.pid };
+    }
+};
