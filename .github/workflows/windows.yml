@@ -17,8 +17,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # windows-2022 is the oldest hosted image, the closest to Windows 10's ConPTY and AF_UNIX
-        os: [windows-2022, windows-2025]
+        # windows-2022 is the oldest hosted image, the closest to Windows 10's ConPTY and AF_UNIX;
+        # windows-11-arm runs the native arm64 build that zmx-arm64.exe ships as
+        os: [windows-2022, windows-2025, windows-11-arm]
         shell: [powershell.exe, cmd.exe]
     steps:
       - uses: actions/checkout@v4
