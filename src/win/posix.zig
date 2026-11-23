@@ -59,8 +59,9 @@ pub const SIG = enum(u32) {
     WINCH = 28,
     _,
 
-    pub const DFL: ?*const fn (SIG) callconv(.c) void = null;
-    pub const IGN: ?*const fn (SIG) callconv(.c) void = @ptrFromInt(1);
+    // align(1) as in std: IGN is the POSIX small integer, which aarch64's 4-byte fn alignment rejects
+    pub const DFL: ?*align(1) const fn (SIG) callconv(.c) void = null;
+    pub const IGN: ?*align(1) const fn (SIG) callconv(.c) void = @ptrFromInt(1);
     pub const UNBLOCK: u32 = 1;
 };
 pub const SA = struct {
@@ -70,8 +71,8 @@ pub const siginfo_t = extern struct { signo: i32 = 0 };
 pub const sigset_t = u32;
 pub const Sigaction = struct {
     handler: extern union {
-        handler: ?*const fn (SIG) callconv(.c) void,
-        sigaction: ?*const fn (SIG, *const siginfo_t, ?*anyopaque) callconv(.c) void,
+        handler: ?*align(1) const fn (SIG) callconv(.c) void,
+        sigaction: ?*align(1) const fn (SIG, *const siginfo_t, ?*anyopaque) callconv(.c) void,
     },
     mask: sigset_t,
     flags: u32,
