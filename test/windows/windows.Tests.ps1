@@ -29,14 +29,10 @@ Describe 'cwd' {
     AfterEach { Remove-ZmxSandbox }
 
     It 'list reports a drive-letter cwd as an OSC 7 URI with the host' {
-        # `zmx __daemon` is not handed the client's cwd; only a shell that reports its own (PowerShell) fills it in.
-        if ((Get-ZmxShellKind) -eq 'cmd') { Set-ItResult -Skipped -Because 'the daemon learns no cwd from the client yet' }
         Invoke-ZmxProcess -Arguments @('run', 't-cwd-uri', '-d', 'echo', 'hi') -WorkingDirectory $script:SpacedDir | Out-Null
         Wait-ZmxSession t-cwd-uri
-        # Decoded before the compare: whether the reported URI escapes the spaces is a separate question.
-        $uri = 'file://' + [Environment]::MachineName + '/' + ($script:SpacedDir -replace '\\', '/')
-        Wait-Until { (Get-ZmxField t-cwd-uri cwd) } 'the session to report a cwd'
-        [Uri]::UnescapeDataString((Get-ZmxField t-cwd-uri cwd)) | Should -Be $uri
+        $uri = 'file://' + [Environment]::MachineName + '/' + ($script:SpacedDir -replace '\\', '/' -replace ' ', '%20')
+        Get-ZmxField t-cwd-uri cwd | Should -Be $uri
     }
 
     It 'a new session starts in a cwd whose name needed escaping' {
