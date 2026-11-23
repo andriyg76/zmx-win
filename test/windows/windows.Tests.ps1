@@ -41,8 +41,8 @@ Describe 'cwd' {
         Wait-ZmxOutput t-cwd-chdir 'zmx spaced dir'
     }
 
-    # Not reflected in `list` yet: the OSC 7 a session command writes does not reach the daemon through ConPTY.
-    It 'an OSC 7 from the session replaces the cwd, remote host included' -Skip {
+    # A profile whose prompt reports its own cwd (a terminal's shell integration) overwrites this one right after.
+    It 'an OSC 7 from the session replaces the cwd, remote host included' {
         if ((Get-ZmxShellKind) -eq 'cmd') { Set-ItResult -Skipped -Because 'cmd cannot emit an escape sequence from a typed line' }
         zmx run t-cwd-osc7 -d "[Console]::Write([char]27+']7;file://some-remote-box/home/me'+[char]7)" | Out-Null
         Wait-ZmxSession t-cwd-osc7
