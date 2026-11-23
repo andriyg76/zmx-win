@@ -13,7 +13,7 @@ pub fn isConsole(which: api.DWORD) bool {
 
 // ---- signals ----
 
-const Handler = *const fn (posix.SIG, *const posix.siginfo_t, ?*anyopaque) callconv(.c) void;
+const Handler = *align(1) const fn (posix.SIG, *const posix.siginfo_t, ?*anyopaque) callconv(.c) void;
 var handlers: [32]?Handler = @splat(null);
 var ctrl_installed = std.atomic.Value(bool).init(false);
 
