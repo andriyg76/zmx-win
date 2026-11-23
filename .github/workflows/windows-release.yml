@@ -1,0 +1,45 @@
+name: windows-release
+
+# Run by hand: builds zmx.exe for Windows x64 at `rev` (a commit already on this repository's history) and publishes
+# release win-<rev12> with zmx.exe, LICENSE and zmx.exe.sha256, which agterm-win's fetch-zmx.ps1 pins and verifies.
+on:
+  workflow_dispatch:
+    inputs:
+      rev:
+        description: commit to build (full sha); empty builds the dispatched ref
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.rev || github.sha }}
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+      - run: zig build -Doptimize=ReleaseSafe
+      - run: zig build test
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $rev = (git rev-parse HEAD).Trim()
+          $tag = "win-$($rev.Substring(0, 12))"
+          $out = Join-Path $env:RUNNER_TEMP "zmx"
+          New-Item -ItemType Directory $out | Out-Null
+          Copy-Item zig-out/bin/zmx.exe, LICENSE $out
+          $exe = Join-Path $out "zmx.exe"
+          $hash = (Get-FileHash -Algorithm SHA256 $exe).Hash.ToLowerInvariant()
+          [IO.File]::WriteAllText("$exe.sha256", "$hash  zmx.exe`n")
+          $zig = (zig version).Trim()
+          gh release create $tag --target $rev $exe "$exe.sha256" (Join-Path $out "LICENSE") `
+            --title "zmx $tag" --notes "zmx.exe for Windows x64 at $rev, ReleaseSafe, Zig $zig."
