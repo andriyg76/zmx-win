@@ -12,6 +12,9 @@ Import-Module Pester -MinimumVersion 5.5
 if ($Shell) { $env:ZMX_TEST_SHELL = $Shell } else { Remove-Item Env:ZMX_TEST_SHELL -ErrorAction SilentlyContinue }
 if ($Zmx) { $env:ZMX_TEST_EXE = (Resolve-Path $Zmx).Path }
 
+$os = Get-CimInstance Win32_OperatingSystem
+"OS: $($os.Caption) $($os.Version)"
+
 $config = New-PesterConfiguration
 $config.Run.Path = $PSScriptRoot
 $config.Run.Exit = $true

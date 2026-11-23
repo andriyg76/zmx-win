@@ -11,12 +11,14 @@ permissions:
 
 jobs:
   test:
-    name: test (${{ matrix.shell }})
-    runs-on: windows-latest
+    name: test (${{ matrix.os }}, ${{ matrix.shell }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
+        # windows-2022 is the oldest hosted image, the closest to Windows 10's ConPTY and AF_UNIX
+        os: [windows-2022, windows-2025]
         shell: [powershell.exe, cmd.exe]
     steps:
       - uses: actions/checkout@v4
@@ -43,6 +45,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: test-results-${{ matrix.shell }}
+          name: test-results-${{ matrix.os }}-${{ matrix.shell }}
           path: test-results.xml
           if-no-files-found: ignore
