@@ -1,7 +1,8 @@
 name: windows-release
 
-# Run by hand: builds zmx.exe for Windows x64 at `rev` (a commit already on this repository's history) and publishes
-# release win-<rev12> with zmx.exe, LICENSE and zmx.exe.sha256, which agterm-win's fetch-zmx.ps1 pins and verifies.
+# Run by hand: builds zmx for Windows x64 and arm64 at `rev`, each natively on its own runner with its tests, and
+# publishes release win-<rev12> with zmx-x64.exe, zmx-arm64.exe, zmx.sha256 and LICENSE, which agterm-win's
+# fetch-zmx.ps1 pins and verifies.
 on:
   workflow_dispatch:
     inputs:
@@ -13,8 +14,15 @@ permissions:
   contents: write
 
 jobs:
-  release:
-    runs-on: windows-2022
+  build:
+    strategy:
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-2022
+          - arch: arm64
+            runner: windows-11-arm
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     defaults:
       run:
@@ -28,18 +36,30 @@ jobs:
           version: 0.17.1
       - run: zig build -Doptimize=ReleaseSafe
       - run: zig build test
-      - name: Publish
-        env:
+      - run: Copy-Item zig-out/bin/zmx.exe zmx-${{ matrix.arch }}.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zmx-${{ matrix.arch }}
+          path: zmx-${{ matrix.arch }}.exe
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.rev || github.sha }}
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $rev = (git rev-parse HEAD).Trim()
-          $tag = "win-$($rev.Substring(0, 12))"
-          $out = Join-Path $env:RUNNER_TEMP "zmx"
-          New-Item -ItemType Directory $out | Out-Null
-          Copy-Item zig-out/bin/zmx.exe, LICENSE $out
-          $exe = Join-Path $out "zmx.exe"
-          $hash = (Get-FileHash -Algorithm SHA256 $exe).Hash.ToLowerInvariant()
-          [IO.File]::WriteAllText("$exe.sha256", "$hash  zmx.exe`n")
-          $zig = (zig version).Trim()
-          gh release create $tag --target $rev $exe "$exe.sha256" (Join-Path $out "LICENSE") `
-            --title "zmx $tag" --notes "zmx.exe for Windows x64 at $rev, ReleaseSafe, Zig $zig."
+          rev=$(git rev-parse HEAD)
+          tag="win-${rev:0:12}"
+          cp LICENSE dist/
+          (cd dist && sha256sum zmx-x64.exe zmx-arm64.exe > zmx.sha256)
+          gh release create "$tag" --target "$rev" dist/zmx-x64.exe dist/zmx-arm64.exe dist/zmx.sha256 dist/LICENSE \
+            --title "zmx $tag" --notes "zmx for Windows x64 and arm64 at $rev, ReleaseSafe, Zig 0.17.1."
