@@ -1,0 +1,48 @@
+name: windows
+
+on:
+  push:
+    branches: [windows]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.shell }})
+    runs-on: windows-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [powershell.exe, cmd.exe]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+
+      - name: Unit tests
+        if: matrix.shell == 'powershell.exe'
+        run: zig build test --summary failures
+
+      - name: Build
+        run: zig build
+
+      - name: Install Pester
+        shell: pwsh
+        run: Install-Module Pester -MinimumVersion 5.5 -Scope CurrentUser -Force -SkipPublisherCheck
+
+      - name: Integration tests
+        shell: pwsh
+        run: test/windows/run.ps1 -Shell ${{ matrix.shell }} -ResultPath test-results.xml
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results-${{ matrix.shell }}
+          path: test-results.xml
+          if-no-files-found: ignore
