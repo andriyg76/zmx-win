@@ -13,7 +13,7 @@ Describe 'print diagnostics (#4)' {
         for ($i = 1; $i -le 20; $i++) {
             $name = "t-diag-$i"
             $marker = "diag-marker-$i-q"
-            zmx run $name -d echo ready | Out-Null
+            Invoke-ZmxProcess -Arguments (@('run', $name, '-d') + (Get-ZmxEchoSplit 'print-' 'ready')) | Out-Null
             Wait-ZmxSession $name
 
             # tail is a read-only client: it gets every PTY read and the print payload, in the daemon's order
@@ -25,7 +25,8 @@ Describe 'print diagnostics (#4)' {
             if ($env:ZMX_TEST_SHELL) { $psi.Environment['SHELL'] = $env:ZMX_TEST_SHELL }
             $tail = [Diagnostics.Process]::Start($psi)
             $tailOut = $tail.StandardOutput.ReadToEndAsync()
-            Wait-ZmxOutput $name ready 20
+            Wait-ZmxOutput $name 'print-ready' 20
+            (Invoke-ZmxProcess -Arguments @('wait', $name) -TimeoutSeconds 20).Code | Should -Be 0
             $before = (zmx history --vt $name).Output
 
             $t0 = [DateTime]::UtcNow

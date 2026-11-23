@@ -176,8 +176,11 @@ Describe 'history, wait, send and print' {
     }
 
     It 'print puts text into the terminal state' {
-        zmx run t-print -d echo ready | Out-Null
-        Wait-ZmxOutput t-print ready
+        # Wait for output the command alone prints, and for the command to finish: PSReadLine's inline prediction
+        # can show `echo ready` from history, and a print while it renders the input lines is painted over.
+        Invoke-ZmxProcess -Arguments (@('run', 't-print', '-d') + (Get-ZmxEchoSplit 'print-' 'ready')) | Out-Null
+        Wait-ZmxOutput t-print 'print-ready'
+        (Invoke-ZmxProcess -Arguments @('wait', 't-print') -TimeoutSeconds 20).Code | Should -Be 0
 
         $r = Invoke-ZmxProcess -Arguments @('print', 't-print') -Stdin "`r`npester-print-marker-abc123`r`n"
         $r.Code | Should -Be 0
