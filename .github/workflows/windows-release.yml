@@ -1,0 +1,65 @@
+name: windows-release
+
+# Run by hand: builds zmx for Windows x64 and arm64 at `rev`, each natively on its own runner with its tests, and
+# publishes release win-<rev12> with zmx-x64.exe, zmx-arm64.exe, zmx.sha256 and LICENSE, which agterm-win's
+# fetch-zmx.ps1 pins and verifies.
+on:
+  workflow_dispatch:
+    inputs:
+      rev:
+        description: commit to build (full sha); empty builds the dispatched ref
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-2022
+          - arch: arm64
+            runner: windows-11-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.rev || github.sha }}
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+      - run: zig build -Doptimize=ReleaseSafe
+      - run: zig build test
+      - run: Copy-Item zig-out/bin/zmx.exe zmx-${{ matrix.arch }}.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zmx-${{ matrix.arch }}
+          path: zmx-${{ matrix.arch }}.exe
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.rev || github.sha }}
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          rev=$(git rev-parse HEAD)
+          tag="win-${rev:0:12}"
+          cp LICENSE dist/
+          (cd dist && sha256sum zmx-x64.exe zmx-arm64.exe > zmx.sha256)
+          gh release create "$tag" --target "$rev" dist/zmx-x64.exe dist/zmx-arm64.exe dist/zmx.sha256 dist/LICENSE \
+            --title "zmx $tag" --notes "zmx for Windows x64 and arm64 at $rev, ReleaseSafe, Zig 0.17.1."
