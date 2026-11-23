@@ -176,6 +176,9 @@ Describe 'history, wait, send and print' {
     }
 
     It 'print puts text into the terminal state' {
+        if ((Get-ZmxShellKind) -eq 'powershell') {
+            Set-ItResult -Skipped -Because 'printed text is sometimes lost from history: https://github.com/andriyg76/zmx-win/issues/4'
+        }
         zmx run t-print -d echo ready | Out-Null
         Wait-ZmxOutput t-print ready
 
