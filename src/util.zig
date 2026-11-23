@@ -593,6 +593,139 @@ test "taskMarkerLine follows each shell's syntax" {
     );
 }
 
+/// The line `zmx write` types to put `encoded`, one base64 chunk of the file, at `path`: the first chunk creates
+/// the file and the rest append to it. cmd has no base64 decoder, so its chunks collect in a temp file named by
+/// `id` for appendWriteEnd to decode with certutil. PowerShell's are bare lines for the reader appendWriteReader
+/// starts.
+pub fn appendWriteChunk(
+    gpa: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    kind: ShellKind,
+    encoded: []const u8,
+    path: []const u8,
+    id: []const u8,
+    first: bool,
+) !void {
+    switch (kind) {
+        .posix => {
+            try out.appendSlice(gpa, "printf '%s' '");
+            try out.appendSlice(gpa, encoded);
+            try out.appendSlice(gpa, if (first) "' | base64 -d > '" else "' | base64 -d >> '");
+            try out.appendSlice(gpa, path);
+            try out.appendSlice(gpa, "'\r");
+        },
+        .powershell => {
+            // Windows PowerShell's Console.In returns at most 254 characters a line: 252 is whole base64 quads
+            var rest = encoded;
+            while (rest.len > 0) {
+                const n = @min(rest.len, 252);
+                try out.appendSlice(gpa, rest[0..n]);
+                try out.appendSlice(gpa, "\r");
+                rest = rest[n..];
+            }
+        },
+        .cmd => {
+            // an empty file has no chunk to echo, and `echo` alone would write "ECHO is on."
+            if (encoded.len == 0) return;
+            // the redirect goes first, or a chunk that ends in a digit names the stream it redirects
+            try out.appendSlice(gpa, if (first) ">\"%TEMP%\\zmx-write-" else ">>\"%TEMP%\\zmx-write-");
+            try out.appendSlice(gpa, id);
+            try out.appendSlice(gpa, ".b64\" echo ");
+            try out.appendSlice(gpa, encoded);
+            try out.appendSlice(gpa, "\r");
+        },
+    }
+}
+
+/// PowerShell only: the line that starts a reader for a `zmx write`'s chunks, typed as plain console lines because
+/// PSReadLine takes typed input a key at a time and slows down the more is queued. The reader prints
+/// writeReadyMarker(id) before it reads, and the daemon holds the chunks back until it does, since PSReadLine reads
+/// ahead any line typed while it is still at the prompt. The path resolves against the shell's location, which
+/// `cd` moves without moving the process cwd.
+pub fn appendWriteReader(gpa: std.mem.Allocator, out: *std.ArrayList(u8), path: []const u8, id: []const u8) !void {
+    try out.appendSlice(gpa, "& {$f=[IO.File]::Open($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath('");
+    for (path) |c| if (c == '\'') try out.appendSlice(gpa, "''") else try out.append(gpa, c);
+    // the marker is joined at run time, so the echoed command line does not hold it
+    try out.appendSlice(gpa, "'),'Create');try{[Console]::Out.WriteLine('ZMX_WRITE_'+'READY:");
+    try out.appendSlice(gpa, id);
+    try out.appendSlice(gpa, "');while(($l=[Console]::In.ReadLine()) -ne '.'){$b=[Convert]::FromBase64String($l);" ++
+        "$f.Write($b,0,$b.Length)}}finally{$f.Close()}}\r");
+}
+
+pub fn writeReadyMarker(buf: []u8, id: []const u8) ![]u8 {
+    return std.fmt.bufPrint(buf, "ZMX_WRITE_READY:{s}", .{id});
+}
+
+/// The line, if any, that finishes a `zmx write` after its chunks: PowerShell's reader stops, and cmd decodes
+/// what it collected.
+pub fn appendWriteEnd(gpa: std.mem.Allocator, out: *std.ArrayList(u8), kind: ShellKind, path: []const u8, id: []const u8, empty: bool) !void {
+    switch (kind) {
+        .posix => {},
+        .powershell => try out.appendSlice(gpa, ".\r"),
+        .cmd => {
+            if (empty) {
+                try out.appendSlice(gpa, "type nul>\"");
+                try out.appendSlice(gpa, path);
+                try out.appendSlice(gpa, "\"\r");
+                return;
+            }
+            try out.appendSlice(gpa, "certutil -f -decode \"%TEMP%\\zmx-write-");
+            try out.appendSlice(gpa, id);
+            try out.appendSlice(gpa, ".b64\" \"");
+            try out.appendSlice(gpa, path);
+            try out.appendSlice(gpa, "\" >nul & del \"%TEMP%\\zmx-write-");
+            try out.appendSlice(gpa, id);
+            try out.appendSlice(gpa, ".b64\"\r");
+        },
+    }
+}
+
+test "zmx write lines follow each shell's syntax" {
+    const gpa = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+
+    try appendWriteChunk(gpa, &out, .posix, "QUJD", "f.txt", "id", true);
+    try appendWriteChunk(gpa, &out, .posix, "REVG", "f.txt", "id", false);
+    try appendWriteEnd(gpa, &out, .posix, "f.txt", "id", false);
+    try std.testing.expectEqualStrings("printf '%s' 'QUJD' | base64 -d > 'f.txt'\rprintf '%s' 'REVG' | base64 -d >> 'f.txt'\r", out.items);
+
+    out.clearRetainingCapacity();
+    try appendWriteReader(gpa, &out, "it's.txt", "id");
+    try std.testing.expectEqualStrings(
+        "& {$f=[IO.File]::Open($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath('it''s.txt')," ++
+            "'Create');try{[Console]::Out.WriteLine('ZMX_WRITE_'+'READY:id');while(($l=[Console]::In.ReadLine()) -ne '.')" ++
+            "{$b=[Convert]::FromBase64String($l);$f.Write($b,0,$b.Length)}}finally{$f.Close()}}\r",
+        out.items,
+    );
+    var marker_buf: [32]u8 = undefined;
+    try std.testing.expect(std.mem.indexOf(u8, out.items, try writeReadyMarker(&marker_buf, "id")) == null);
+
+    out.clearRetainingCapacity();
+    var long: [256]u8 = undefined;
+    for (0..64) |i| @memcpy(long[i * 4 ..][0..4], "QUJD");
+    try appendWriteChunk(gpa, &out, .powershell, &long, "f.txt", "id", true);
+    try appendWriteChunk(gpa, &out, .powershell, "REVG", "f.txt", "id", false);
+    try appendWriteEnd(gpa, &out, .powershell, "f.txt", "id", false);
+    try std.testing.expectEqualStrings(long[0..252], out.items[0..252]);
+    try std.testing.expectEqualStrings("\rQUJD\rREVG\r.\r", out.items[252..]);
+
+    out.clearRetainingCapacity();
+    try appendWriteChunk(gpa, &out, .cmd, "QUJ1", "f.txt", "id", true);
+    try appendWriteChunk(gpa, &out, .cmd, "REV2", "f.txt", "id", false);
+    try appendWriteEnd(gpa, &out, .cmd, "f.txt", "id", false);
+    try std.testing.expectEqualStrings(
+        ">\"%TEMP%\\zmx-write-id.b64\" echo QUJ1\r>>\"%TEMP%\\zmx-write-id.b64\" echo REV2\r" ++
+            "certutil -f -decode \"%TEMP%\\zmx-write-id.b64\" \"f.txt\" >nul & del \"%TEMP%\\zmx-write-id.b64\"\r",
+        out.items,
+    );
+
+    out.clearRetainingCapacity();
+    try appendWriteChunk(gpa, &out, .cmd, "", "f.txt", "id", true);
+    try appendWriteEnd(gpa, &out, .cmd, "f.txt", "id", true);
+    try std.testing.expectEqualStrings("type nul>\"f.txt\"\r", out.items);
+}
+
 pub fn getTaskExitMarker(buf: []u8, id_marker: [4]u8) ![]u8 {
     return std.fmt.bufPrint(buf, "ZMX_TASK_COMPLETED:{s}:", .{id_marker});
 }
@@ -1638,23 +1771,23 @@ test "stripAnsi: UTF-8 bytes do not start escape sequences" {
 
 test "isLeaderUse: keys, paste and presses, never a terminal's replies, motion or release" {
     const used = [_][]const u8{
-        "a",              "\x03",                "\x04",          "\x7f",            "\x1b",
-        "\x1bx",          "\x1b\x1b",            "\x1b[A",        "\x1bOA",          "\x1b[H",
-        "\x1b[F",         "\x1b[Z",              "\x1b[3~",       "\x1b[1;5P",       "\x1b[99;5u",
-        "\x1b[200~x",     "\x1b[<0;10;5M",       "\x1b[<64;1;1M", "\x1b[M !!",       "\x1b[I\x03",
-        "\x1b[?1u\x1b[A", "\x1b]11;rgb:0/0/0\x07q", "\x1b[12",       "\x1b[102;1:1u",   "\x1b[27u",
-        "\x1b[97u",       "\x1b[13u",             "\x1b]",          "\x1bP",           "\x1b]5522;type=read:status=OK\x1b\\",
+        "a",              "\x03",                   "\x04",          "\x7f",          "\x1b",
+        "\x1bx",          "\x1b\x1b",               "\x1b[A",        "\x1bOA",        "\x1b[H",
+        "\x1b[F",         "\x1b[Z",                 "\x1b[3~",       "\x1b[1;5P",     "\x1b[99;5u",
+        "\x1b[200~x",     "\x1b[<0;10;5M",          "\x1b[<64;1;1M", "\x1b[M !!",     "\x1b[I\x03",
+        "\x1b[?1u\x1b[A", "\x1b]11;rgb:0/0/0\x07q", "\x1b[12",       "\x1b[102;1:1u", "\x1b[27u",
+        "\x1b[97u",       "\x1b[13u",               "\x1b]",         "\x1bP",         "\x1b]5522;type=read:status=OK\x1b\\",
     };
     for (used) |input| {
         if (!isLeaderUse(input)) std.debug.print("not counted as use: {any}\n", .{input});
         try testing.expect(isLeaderUse(input));
     }
     const replies = [_][]const u8{
-        "",                     "\x1b[?62;22c",         "\x1b[>1;10;0c",          "\x1b[12;40R",
-        "\x1b[0n",              "\x1b[?1u",             "\x1b[?2004;2$y",         "\x1b[I",
-        "\x1b[O",               "\x1b[8;24;80t",        "\x1b]11;rgb:0/0/0\x07",  "\x1b]10;rgb:f/f/f\x1b\\",
-        "\x1bP>|ghostty\x1b\\", "\x1b[<0;10;5m",        "\x1b[<35;10;5M",         "\x1b[MC!!",
-        "\x1b[M#!!",            "\x1b[102;1:3u",        "\x1b[?997;1n",
+        "",                     "\x1b[?62;22c",  "\x1b[>1;10;0c",         "\x1b[12;40R",
+        "\x1b[0n",              "\x1b[?1u",      "\x1b[?2004;2$y",        "\x1b[I",
+        "\x1b[O",               "\x1b[8;24;80t", "\x1b]11;rgb:0/0/0\x07", "\x1b]10;rgb:f/f/f\x1b\\",
+        "\x1bP>|ghostty\x1b\\", "\x1b[<0;10;5m", "\x1b[<35;10;5M",        "\x1b[MC!!",
+        "\x1b[M#!!",            "\x1b[102;1:3u", "\x1b[?997;1n",
     };
     for (replies) |input| {
         if (isLeaderUse(input)) std.debug.print("counted as use: {any}\n", .{input});

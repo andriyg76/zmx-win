@@ -184,8 +184,7 @@ Describe 'history, wait, send and print' {
         Wait-ZmxOutput t-print 'pester-print-marker-abc123'
     }
 
-    # The daemon types a POSIX `printf | base64 -d` pipeline into the shell, which PowerShell and cmd lack.
-    It 'write delivers a file larger than the console input buffer whole' -Skip {
+    It 'write delivers a file larger than the console input buffer whole' {
         $src = Join-Path $script:ZmxDir 'src.bin'
         $dst = Join-Path $script:ZmxDir 'dst.bin'
         $bytes = [byte[]]::new(400000)
@@ -196,6 +195,8 @@ Describe 'history, wait, send and print' {
         Wait-ZmxOutput t-write write-ready
         $r = Invoke-ZmxProcess -Arguments @('write', 't-write', $dst) -Stdin $bytes -TimeoutSeconds 30
         $r.Code | Should -Be 0
-        Wait-Until { (Test-Path $dst) -and (Get-FileHash $dst).Hash -eq (Get-FileHash $src).Hash } 'the written file to match' 30
+        $want = (Get-FileHash $src).Hash
+        # the shell keeps the file open while it writes, so a read can find it locked
+        Wait-Until { try { (Get-FileHash $dst -ErrorAction Stop).Hash -eq $want } catch { $false } } 'the written file to match' 30
     }
 }

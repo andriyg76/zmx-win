@@ -61,8 +61,9 @@ function Invoke-ZmxProcess {
     $stdout = $p.StandardOutput.ReadToEndAsync()
     $stderr = $p.StandardError.ReadToEndAsync()
     if ($PSBoundParameters.ContainsKey('Stdin')) {
-        $bytes = if ($Stdin -is [byte[]]) { $Stdin } else { [Text.UTF8Encoding]::new($false).GetBytes([string]$Stdin) }
-        $p.StandardInput.BaseStream.Write($bytes, 0, $bytes.Length)
+        # assigned per branch: an `if` expression would unroll an empty byte[] to $null
+        if ($Stdin -is [string]) { $bytes = [Text.UTF8Encoding]::new($false).GetBytes($Stdin) } else { $bytes = [byte[]]$Stdin }
+        if ($bytes.Length) { $p.StandardInput.BaseStream.Write($bytes, 0, $bytes.Length) }
     }
     $p.StandardInput.Close()
     if (-not $p.WaitForExit($TimeoutSeconds * 1000)) {

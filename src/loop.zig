@@ -605,6 +605,8 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                         );
                     }
 
+                    if (daemon.write_ready.len > 0) daemon.releaseHeldWrite(gpa, buf[0..n]);
+
                     daemon.relayPtyOutput(gpa, buf[0..n]);
                 }
             }
@@ -697,7 +699,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                         .Type => try daemon.handleType(gpa, client, &term, msg.payload),
                         .Screen => try daemon.handleScreen(gpa, client, &term, msg.payload),
                         .Ack, .TaskComplete, .LabelData, .EnvData, .Role, .Unsupported => {},
-                        .Write => try daemon.handleWrite(gpa, client, msg.payload),
+                        .Write => try daemon.handleWrite(gpa, io, client, msg.payload),
                         _ => {
                             std.log.warn(
                                 "ignoring unknown IPC tag={d}",
@@ -825,6 +827,12 @@ pub const Daemon = struct {
     socket_path: []const u8,
     // === opt ===
     pty_write_buf: std.ArrayList(u8) = .empty,
+    // `zmx write` lines for a PowerShell reader, held until its ready marker shows (util.appendWriteReader)
+    write_held: std.ArrayList(u8) = .empty,
+    write_ready_buf: [32]u8 = undefined,
+    write_ready: []const u8 = "",
+    write_carry: [32]u8 = undefined,
+    write_carry_len: usize = 0,
     clients: std.ArrayList(*Client) = .empty,
     labels: std.StringHashMapUnmanaged([]u8) = .empty,
     // This control which client is the leader.  The leader controls terminal state and
@@ -884,6 +892,7 @@ pub const Daemon = struct {
         }
         self.labels.deinit(gpa);
         self.pty_write_buf.deinit(gpa);
+        self.write_held.deinit(gpa);
     }
 
     pub fn shutdown(self: *Daemon, gpa: std.mem.Allocator) void {
@@ -1711,7 +1720,39 @@ pub const Daemon = struct {
         }
     }
 
-    pub fn handleWrite(self: *Daemon, gpa: std.mem.Allocator, client: *Client, payload: []const u8) !void {
+    /// Hands the PTY the `zmx write` lines held for a PowerShell reader once `output` shows its ready marker,
+    /// which may straddle two reads.
+    pub fn releaseHeldWrite(self: *Daemon, gpa: std.mem.Allocator, output: []const u8) void {
+        const marker = self.write_ready;
+        var window: [64]u8 = undefined;
+        const head = output[0..@min(output.len, marker.len - 1)];
+        @memcpy(window[0..self.write_carry_len], self.write_carry[0..self.write_carry_len]);
+        @memcpy(window[self.write_carry_len..][0..head.len], head);
+        const seen = std.mem.indexOf(u8, output, marker) != null or
+            std.mem.indexOf(u8, window[0 .. self.write_carry_len + head.len], marker) != null;
+        if (!seen) {
+            const keep = marker.len - 1;
+            if (output.len >= keep) {
+                @memcpy(self.write_carry[0..keep], output[output.len - keep ..]);
+                self.write_carry_len = keep;
+            } else {
+                const old = @min(self.write_carry_len, keep - output.len);
+                std.mem.copyForwards(u8, self.write_carry[0..old], self.write_carry[self.write_carry_len - old .. self.write_carry_len]);
+                @memcpy(self.write_carry[old..][0..output.len], output);
+                self.write_carry_len = old + output.len;
+            }
+            return;
+        }
+        std.log.debug("write reader ready marker={s} held={d}", .{ marker, self.write_held.items.len });
+        self.pty_write_buf.appendSlice(gpa, self.write_held.items) catch |err| {
+            std.log.warn("failed to release held write err={s}", .{@errorName(err)});
+        };
+        self.write_held.clearRetainingCapacity();
+        self.write_ready = "";
+        self.write_carry_len = 0;
+    }
+
+    pub fn handleWrite(self: *Daemon, gpa: std.mem.Allocator, io: std.Io, client: *Client, payload: []const u8) !void {
         // Wire format: [u32 path len][path bytes][file content]
         if (payload.len < @sizeOf(u32)) return error.InvalidPayload;
         const path_len = std.mem.bytesToValue(u32, payload[0..@sizeOf(u32)]);
@@ -1720,14 +1761,27 @@ pub const Daemon = struct {
         const file_content = payload[@sizeOf(u32) + path_len ..];
 
         // Inject file creation through the PTY so it works over SSH.
-        // Base64-encode content and pipe through printf | base64 -d > file.
-        // Chunk large files to stay under command-line length limits.
+        // Base64-encode content and type a line per chunk that decodes it into the file, in the session shell's
+        // syntax (util.appendWriteChunk). Chunk large files to stay under command-line length limits.
         // 48000 is divisible by 3 (clean base64 boundaries) and encodes
-        // to ~64KB, well under typical ARG_MAX.
+        // to ~64KB, well under typical ARG_MAX. cmd reads at most 8191 characters a line, so the Windows
+        // shells get 5700, which encodes to 7600.
         // The commands skip queuePtyInput's cap: it would drop the chunks
         // past PTY_WRITE_BUF_MAX and leave the file cut short. The payload
         // is already bounded by ipc.MAX_PAYLOAD_LEN.
-        const chunk_size = 48000;
+        const shell_kind = util.ShellKind.of(self.sessionShell());
+        const chunk_size: usize = if (shell_kind == .posix) 48000 else 5700;
+        const id_parts = .{ util.generateTaskId(io), util.generateTaskId(io) };
+        var id_buf: [8]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buf, "{s}{s}", id_parts);
+        // A PowerShell reader takes the chunks once it runs. A write that comes while one is held queues behind it
+        // whole, reader included, and goes out with it ungated.
+        const lines = if (shell_kind == .powershell) &self.write_held else &self.pty_write_buf;
+        if (shell_kind == .powershell) {
+            const out = if (self.write_ready.len > 0) &self.write_held else &self.pty_write_buf;
+            try util.appendWriteReader(gpa, out, file_path, id);
+            if (self.write_ready.len == 0) self.write_ready = try util.writeReadyMarker(&self.write_ready_buf, id);
+        }
         var offset: usize = 0;
         var is_first = true;
 
@@ -1740,20 +1794,12 @@ pub const Daemon = struct {
             defer gpa.free(encoded);
             _ = std.base64.standard.Encoder.encode(encoded, chunk);
 
-            try self.pty_write_buf.appendSlice(gpa, "printf '%s' '");
-            try self.pty_write_buf.appendSlice(gpa, encoded);
-            if (is_first) {
-                try self.pty_write_buf.appendSlice(gpa, "' | base64 -d > '");
-            } else {
-                try self.pty_write_buf.appendSlice(gpa, "' | base64 -d >> '");
-            }
-            try self.pty_write_buf.appendSlice(gpa, file_path);
-            try self.pty_write_buf.appendSlice(gpa, "'");
-            try self.pty_write_buf.appendSlice(gpa, "\r");
+            try util.appendWriteChunk(gpa, lines, shell_kind, encoded, file_path, id, is_first);
 
             offset = end;
             is_first = false;
         }
+        try util.appendWriteEnd(gpa, lines, shell_kind, file_path, id, file_content.len == 0);
 
         try ipc.appendMessage(gpa, &client.write_buf, .Ack, "");
         client.has_pending_output = true;
