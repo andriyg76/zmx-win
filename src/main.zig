@@ -1501,6 +1501,10 @@ fn windowsDaemon(gpa: std.mem.Allocator, io: std.Io, cfg: *Cfg, args: anytype) !
     daemon.command = argv.items;
     daemon.is_task_mode = std.mem.eql(u8, mode, "task");
     daemon.quiet = true;
+    // The client started this process in the session's directory; a forked daemon keeps the client's setCwd instead.
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_len = std.process.currentPath(io, &cwd_buf) catch 0;
+    if (cwd_len > 0) daemon.setCwd(cwd_buf[0..cwd_len]);
     _ = daemon.ensureSession(io) catch |err| {
         std.log.err("daemon failed session={s} err={s}", .{ sesh, @errorName(err) });
         if (err == error.AddressInUse) std.process.exit(daemonize.win.exit_address_in_use);

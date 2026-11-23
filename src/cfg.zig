@@ -174,7 +174,11 @@ test "mkdirAll fails on dangling symlink instead of looping" {
     const tmp_path = try std.fs.path.join(alloc, &.{ cwd_path, ".zig-cache", "tmp", &tmp.sub_path });
     defer alloc.free(tmp_path);
 
-    try tmp.dir.symLink(std.testing.io, "nonexistent", "broken_link", .{});
+    // Windows lets only an elevated process or Developer Mode create a symlink.
+    tmp.dir.symLink(std.testing.io, "nonexistent", "broken_link", .{}) catch |err| switch (err) {
+        error.PermissionDenied => return error.SkipZigTest,
+        else => return err,
+    };
 
     const target_path = try std.fs.path.join(alloc, &.{ tmp_path, "broken_link", "sub" });
     defer alloc.free(target_path);

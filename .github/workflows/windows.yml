@@ -1,0 +1,51 @@
+name: windows
+
+on:
+  push:
+    branches: [windows]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, ${{ matrix.shell }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # windows-2022 is the oldest hosted image, the closest to Windows 10's ConPTY and AF_UNIX;
+        # windows-11-arm runs the native arm64 build that zmx-arm64.exe ships as
+        os: [windows-2022, windows-2025, windows-11-arm]
+        shell: [powershell.exe, cmd.exe]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+
+      - name: Unit tests
+        if: matrix.shell == 'powershell.exe'
+        run: zig build test --summary failures
+
+      - name: Build
+        run: zig build
+
+      - name: Install Pester
+        shell: pwsh
+        run: Install-Module Pester -MinimumVersion 5.5 -Scope CurrentUser -Force -SkipPublisherCheck
+
+      - name: Integration tests
+        shell: pwsh
+        run: test/windows/run.ps1 -Shell ${{ matrix.shell }} -ResultPath test-results.xml
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results-${{ matrix.os }}-${{ matrix.shell }}
+          path: test-results.xml
+          if-no-files-found: ignore

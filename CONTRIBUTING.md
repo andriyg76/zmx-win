@@ -19,6 +19,15 @@ bats --jobs 1 test/*.bats        # run integration tests
 zig fmt --check .                # check formatting
 ```
 
+On Windows the integration tests are a [Pester](https://pester.dev/) 5 suite in `test/windows`, which CI runs with
+each session shell:
+
+```powershell
+zig build
+pwsh test/windows/run.ps1                  # sessions run PowerShell, zmx's default
+pwsh test/windows/run.ps1 -Shell cmd.exe   # sessions run cmd
+```
+
 ## local debugging
 
 Isolate development sessions from your running `zmx` sessions using `ZMX_DIR`:

@@ -36,6 +36,10 @@ jobs:
           version: 0.17.1
       - run: zig build -Doptimize=ReleaseSafe
       - run: zig build test
+      # the integration suite runs against the ReleaseSafe zmx.exe that is published, with each session shell
+      - run: Install-Module Pester -MinimumVersion 5.5 -Scope CurrentUser -Force -SkipPublisherCheck
+      - run: test/windows/run.ps1 -Shell powershell.exe
+      - run: test/windows/run.ps1 -Shell cmd.exe
       - run: Copy-Item zig-out/bin/zmx.exe zmx-${{ matrix.arch }}.exe
       - uses: actions/upload-artifact@v4
         with:
