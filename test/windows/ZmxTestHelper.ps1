@@ -19,9 +19,27 @@ function New-ZmxSandbox {
     New-Item -ItemType Directory -Path $script:ZmxDir | Out-Null
 }
 
+# ZMX_TEST_ARTIFACTS, when set (CI uploads it), keeps what a test leaves for diagnosis: one folder per test, with
+# `zmx list`, the processes the sandbox's sessions run, and the files a test saves itself.
+function Get-ZmxArtifactDir {
+    if (-not $env:ZMX_TEST_ARTIFACTS) { return }
+    $test = if ($____Pester -and $____Pester.CurrentTest) { $____Pester.CurrentTest.ExpandedPath } else { 'unknown' }
+    $dir = Join-Path $env:ZMX_TEST_ARTIFACTS (($test -replace '[^\w.-]+', '_').Trim('_'))
+    New-Item -ItemType Directory -Force $dir | Out-Null
+    $dir
+}
+
+function Save-ZmxArtifact([string]$Name, [string]$Text) {
+    $dir = Get-ZmxArtifactDir
+    if ($dir) { [IO.File]::WriteAllText((Join-Path $dir $Name), $Text) }
+}
+
 function Remove-ZmxSandbox {
     if (-not $script:ZmxDir) { return }
     $listed = Invoke-ZmxProcess -Arguments @('list')
+    Save-ZmxArtifact 'list.txt' $listed.Output
+    Save-ZmxArtifact 'processes.txt' (Get-CimInstance Win32_Process | Where-Object { $_.Name -in 'zmx.exe', 'cmd.exe', 'powershell.exe', 'pwsh.exe', 'conhost.exe', 'OpenConsole.exe' } |
+        Format-Table ProcessId, ParentProcessId, Name, CommandLine -AutoSize -Wrap | Out-String -Width 400)
     $names = Invoke-ZmxProcess -Arguments @('list', '--short')
     $sessions = @($names.Output -split "`n" | Where-Object { $_ })
     if ($sessions) { Invoke-ZmxProcess -Arguments (@('kill', '--force') + $sessions) | Out-Null }
@@ -120,8 +138,11 @@ function Get-ZmxCount([string]$Name, [string]$Needle) {
 
 # The words of a command that prints $Left$Right, assembled at runtime so that the marker shows up in history only
 # as program output, never in the echoed command line. Words, because `zmx run` quotes an argument with a space.
+# cmd expands %var% when it reads the whole line, so each $Left gets a variable of its own: a reused one would
+# print the value an earlier line set.
 function Get-ZmxEchoSplit([string]$Left, [string]$Right) {
-    if ((Get-ZmxShellKind) -eq 'cmd') { @('set', "zx=$Left&&", 'call', 'echo', "%zx%$Right") } else { @('Write-Output', "('$Left'+'$Right')") }
+    $var = 'zx' + ($Left -replace '\W', '')
+    if ((Get-ZmxShellKind) -eq 'cmd') { @('set', "$var=$Left&&", 'call', 'echo', "%$var%$Right") } else { @('Write-Output', "('$Left'+'$Right')") }
 }
 
 # A client that speaks the attach handshake over the session's AF_UNIX socket and holds it open, standing in for
@@ -134,3 +155,24 @@ function Connect-ZmxSession([string]$Name, [uint16]$Rows = 24, [uint16]$Cols = 8
     $s.Send([byte[]]($header + $payload)) | Out-Null
     $s
 }
+
+# every test file dot-sources this, and a type is added once per PowerShell session
+if (-not ('ZmxConPty' -as [type])) { Add-Type -Path (Join-Path $PSScriptRoot 'ZmxConPty.cs') }
+
+# The shell a terminal pane runs: ZMX_TEST_SHELL, else the PowerShell zmx picks itself.
+function Get-ZmxPaneShell { if ($env:ZMX_TEST_SHELL) { $env:ZMX_TEST_SHELL } else { 'powershell.exe' } }
+
+# `zmx attach <name> <command...>` in a process of its own under a pseudo console, as agterm-win starts a Live pane:
+# it creates the session with that command, or attaches to the one already there. Dispose it to end the client.
+function Start-ZmxAttach([string]$Name, [string[]]$Command = @(), [int16]$Rows = 24, [int16]$Cols = 80) {
+    $environment = @{}
+    foreach ($e in [Environment]::GetEnvironmentVariables().GetEnumerator()) {
+        if ($e.Key -notlike 'ZMX_*' -and $e.Key -ne 'SHELL') { $environment[$e.Key] = $e.Value }
+    }
+    $environment['ZMX_DIR'] = $script:ZmxDir
+    $environment['ZMX_NO_DETACH_KEY'] = '1'
+    if ($env:ZMX_TEST_SHELL) { $environment['SHELL'] = $env:ZMX_TEST_SHELL }
+    $line = (@($script:ZmxExe, 'attach', $Name) + $Command | ForEach-Object { if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } }) -join ' '
+    [ZmxConPty]::new($line, $environment, $script:RepoDir, $Rows, $Cols)
+}
+
