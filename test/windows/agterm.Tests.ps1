@@ -13,7 +13,8 @@ Describe 'attach --detached (0005)' {
 
     It 'creates the session and returns without attaching' {
         $ran = Join-Path $script:ZmxDir 'ran'
-        $r = Invoke-ZmxProcess -Arguments (@('attach', '--detached', 't-detached') + (Get-TouchCommand $ran))
+        # /k keeps cmd, and with it the session, running after the touch
+        $r = Invoke-ZmxProcess -Arguments @('attach', '--detached', 't-detached', 'cmd.exe', '/k', 'type', 'nul', '>', $ran)
         $r.Code | Should -Be 0
         Wait-ZmxSession t-detached
         Get-ZmxField t-detached clients | Should -Be '0'
