@@ -19,9 +19,27 @@ function New-ZmxSandbox {
     New-Item -ItemType Directory -Path $script:ZmxDir | Out-Null
 }
 
+# ZMX_TEST_ARTIFACTS, when set (CI uploads it), keeps what a test leaves for diagnosis: one folder per test, with
+# `zmx list`, the processes the sandbox's sessions run, and the files a test saves itself.
+function Get-ZmxArtifactDir {
+    if (-not $env:ZMX_TEST_ARTIFACTS) { return }
+    $test = if ($____Pester -and $____Pester.CurrentTest) { $____Pester.CurrentTest.ExpandedPath } else { 'unknown' }
+    $dir = Join-Path $env:ZMX_TEST_ARTIFACTS (($test -replace '[^\w.-]+', '_').Trim('_'))
+    New-Item -ItemType Directory -Force $dir | Out-Null
+    $dir
+}
+
+function Save-ZmxArtifact([string]$Name, [string]$Text) {
+    $dir = Get-ZmxArtifactDir
+    if ($dir) { [IO.File]::WriteAllText((Join-Path $dir $Name), $Text) }
+}
+
 function Remove-ZmxSandbox {
     if (-not $script:ZmxDir) { return }
     $listed = Invoke-ZmxProcess -Arguments @('list')
+    Save-ZmxArtifact 'list.txt' $listed.Output
+    Save-ZmxArtifact 'processes.txt' (Get-CimInstance Win32_Process | Where-Object { $_.Name -in 'zmx.exe', 'cmd.exe', 'powershell.exe', 'pwsh.exe', 'conhost.exe', 'OpenConsole.exe' } |
+        Format-Table ProcessId, ParentProcessId, Name, CommandLine -AutoSize -Wrap | Out-String -Width 400)
     $names = Invoke-ZmxProcess -Arguments @('list', '--short')
     $sessions = @($names.Output -split "`n" | Where-Object { $_ })
     if ($sessions) { Invoke-ZmxProcess -Arguments (@('kill', '--force') + $sessions) | Out-Null }
@@ -155,7 +173,3 @@ function Start-ZmxAttach([string]$Name, [string[]]$Command = @(), [int16]$Rows =
     [ZmxConPty]::new($line, $environment, $script:RepoDir, $Rows, $Cols)
 }
 
-# The processes the session's daemon started, conhost aside: the shell it runs.
-function Get-ZmxDaemonChildren([int]$DaemonId) {
-    @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$DaemonId" | Where-Object { $_.Name -notin 'conhost.exe', 'OpenConsole.exe' })
-}

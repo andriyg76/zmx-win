@@ -41,11 +41,23 @@ jobs:
 
       - name: Integration tests
         shell: pwsh
+        env:
+          ZMX_TEST_ARTIFACTS: ${{ runner.temp }}/zmx-test-artifacts
         run: test/windows/run.ps1 -Shell ${{ matrix.shell }} -ResultPath test-results.xml
+
+      # zmx on Windows logs to %LOCALAPPDATA%\zmx\logs whatever ZMX_DIR is, so the daemons' logs are collected from there
+      - name: Collect logs
+        if: always()
+        shell: pwsh
+        run: |
+          $logs = Join-Path $env:LOCALAPPDATA 'zmx\logs'
+          if (Test-Path $logs) { Copy-Item -Recurse $logs (Join-Path $env:RUNNER_TEMP 'zmx-test-artifacts\zmx-logs') }
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: test-results-${{ matrix.os }}-${{ matrix.shell }}
-          path: test-results.xml
+          path: |
+            test-results.xml
+            ${{ runner.temp }}/zmx-test-artifacts
           if-no-files-found: ignore

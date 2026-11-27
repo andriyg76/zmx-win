@@ -6,7 +6,11 @@ BeforeAll { . (Join-Path $PSScriptRoot 'ZmxTestHelper.ps1') }
 Describe 'attach from another process' {
     BeforeEach { New-ZmxSandbox; $script:Clients = @() }
     AfterEach {
-        foreach ($c in $script:Clients) { $c.Dispose() }
+        $i = 0
+        foreach ($c in $script:Clients) {
+            Save-ZmxArtifact "client-$((++$i)).txt" $c.Output
+            $c.Dispose()
+        }
         Remove-ZmxSandbox
     }
 
@@ -16,10 +20,11 @@ Describe 'attach from another process' {
         $script:Clients += $first
         Wait-ZmxSession t-pane 20
         Wait-Until { (Get-ZmxField t-pane clients) -eq '1' } 'the first client to attach'
-        $daemon = [int](Get-ZmxField t-pane pid)
-        Wait-Until { (Get-ZmxDaemonChildren $daemon).Count -eq 1 } "the daemon to start $shell" 20
-        $pane = (Get-ZmxDaemonChildren $daemon)[0]
+        # list's pid is the session's shell; the daemon is the process that started it
+        $pane = Get-CimInstance Win32_Process -Filter "ProcessId=$([int](Get-ZmxField t-pane pid))"
         $pane.Name | Should -Be ([IO.Path]::GetFileName($shell))
+        $daemon = $pane.ParentProcessId
+        (Get-CimInstance Win32_Process -Filter "ProcessId=$daemon").Name | Should -Be 'zmx.exe'
 
         $first.Write(((Get-ZmxEchoSplit 'first-' 'client') -join ' ') + "`r")
         Wait-ZmxOutput t-pane 'first-client' 20
@@ -34,8 +39,8 @@ Describe 'attach from another process' {
         $second.Process.Id | Should -Not -Be $first.Process.Id
         Wait-Until { (Get-ZmxField t-pane clients) -eq '1' } 'the second client to attach'
         Get-ZmxSessionNames | Should -Be @('t-pane')
-        [int](Get-ZmxField t-pane pid) | Should -Be $daemon
-        (Get-ZmxDaemonChildren $daemon).ProcessId | Should -Be @($pane.ProcessId)
+        [int](Get-ZmxField t-pane pid) | Should -Be $pane.ProcessId
+        (Get-CimInstance Win32_Process -Filter "ProcessId=$($pane.ProcessId)").ParentProcessId | Should -Be $daemon
 
         # the replayed screen reaches the second client, and what it types runs in that shell
         Wait-Until { $second.Output.Contains('first-client') } 'the earlier output on the second client'
