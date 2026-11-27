@@ -1,8 +1,9 @@
 name: windows-release
 
 # Run by hand: builds zmx for Windows x64 and arm64 at `rev`, each natively on its own runner with its tests, and
-# publishes release win-<rev12> with zmx-x64.exe, zmx-arm64.exe, zmx.sha256 and LICENSE, which agterm-win's
-# fetch-zmx.ps1 pins and verifies.
+# publishes release v<upstream>.<build> with zmx-x64.exe, zmx-arm64.exe, zmx.sha256 and LICENSE, which agterm-win's
+# fetch-zmx.ps1 pins and verifies. <upstream> is the zmx version in build.zig.zon at `rev`; <build> counts this
+# port's releases of it from 1, and `zmx version` reports the whole number.
 on:
   workflow_dispatch:
     inputs:
@@ -14,7 +15,26 @@ permissions:
   contents: write
 
 jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.next.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.rev || github.sha }}
+      - id: next
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          upstream=$(sed -n 's/^ *\.version = "\(.*\)",$/\1/p' build.zig.zon)
+          [[ $upstream =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "no upstream version in build.zig.zon: '$upstream'" >&2; exit 1; }
+          last=$(gh release list -R "$GITHUB_REPOSITORY" -L 1000 --json tagName -q '.[].tagName' \
+            | sed -n "s/^v${upstream//./\\.}\.\([0-9][0-9]*\)$/\1/p" | sort -n | tail -1)
+          echo "version=$upstream.$(( ${last:-0} + 1 ))" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: version
     strategy:
       matrix:
         include:
@@ -34,7 +54,7 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.17.1
-      - run: zig build -Doptimize=ReleaseSafe
+      - run: zig build -Doptimize=ReleaseSafe -Dversion=${{ needs.version.outputs.version }}
       - run: zig build test
       # the integration suite runs against the ReleaseSafe zmx.exe that is published, with each session shell
       - run: Install-Module Pester -MinimumVersion 5.5 -Scope CurrentUser -Force -SkipPublisherCheck
@@ -48,7 +68,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    needs: build
+    needs: [version, build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -62,7 +82,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           rev=$(git rev-parse HEAD)
-          tag="win-${rev:0:12}"
+          tag="v${{ needs.version.outputs.version }}"
           cp LICENSE dist/
           (cd dist && sha256sum zmx-x64.exe zmx-arm64.exe > zmx.sha256)
           gh release create "$tag" --target "$rev" dist/zmx-x64.exe dist/zmx-arm64.exe dist/zmx.sha256 dist/LICENSE \
