@@ -54,7 +54,8 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.17.1
-      - run: zig build -Doptimize=ReleaseSafe -Dversion=${{ needs.version.outputs.version }}
+      # quoted: pwsh splits an unquoted -Dversion=1.0.1.1 at its second dot into two arguments
+      - run: zig build -Doptimize=ReleaseSafe "-Dversion=${{ needs.version.outputs.version }}"
       - run: zig build test
       # the integration suite runs against the ReleaseSafe zmx.exe that is published, with each session shell
       - run: Install-Module Pester -MinimumVersion 5.5 -Scope CurrentUser -Force -SkipPublisherCheck
