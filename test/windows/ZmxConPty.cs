@@ -50,6 +50,7 @@ public sealed class ZmxConPty : IDisposable
     static extern bool CloseHandle(IntPtr handle);
 
     const uint ExtendedStartupInfoPresent = 0x00080000, CreateUnicodeEnvironment = 0x00000400;
+    const int UseStdHandles = 0x00000100;
     static readonly IntPtr PseudoConsoleAttribute = (IntPtr)0x00020016;
 
     IntPtr console;
@@ -81,6 +82,8 @@ public sealed class ZmxConPty : IDisposable
                 throw new Win32Exception();
             var startup = new StartupInfoEx { lpAttributeList = list };
             startup.StartupInfo.cb = Marshal.SizeOf<StartupInfoEx>();
+            // null std handles: without them the child inherits this process's redirected stdio instead of the console
+            startup.StartupInfo.dwFlags = UseStdHandles;
             ProcessInformation info;
             if (!CreateProcessW(null, new StringBuilder(commandLine), IntPtr.Zero, IntPtr.Zero, false,
                     ExtendedStartupInfoPresent | CreateUnicodeEnvironment, block, workingDirectory, ref startup, out info))
