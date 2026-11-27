@@ -3,7 +3,8 @@
 
 BeforeAll {
     . (Join-Path $PSScriptRoot 'ZmxTestHelper.ps1')
-    # a command that leaves a file behind, which shows whether it ran
+    # a command that leaves a file behind, which shows whether it ran; each file gets its own name in TestDrive,
+    # never ZMX_DIR, whose every file `zmx list` takes for a stale session socket and deletes
     function Get-TouchCommand([string]$Path) { @('cmd.exe', '/c', 'type', 'nul', '>', $Path) }
 }
 
@@ -12,7 +13,7 @@ Describe 'attach --detached (0005)' {
     AfterEach { Remove-ZmxSandbox }
 
     It 'creates the session and returns without attaching' {
-        $ran = Join-Path $script:ZmxDir 'ran'
+        $ran = Join-Path $TestDrive "ran-$(New-Guid)"
         # /k keeps cmd, and with it the session, running after the touch
         $r = Invoke-ZmxProcess -Arguments @('attach', '--detached', 't-detached', 'cmd.exe', '/k', 'type', 'nul', '>', $ran)
         $r.Code | Should -Be 0
@@ -36,7 +37,7 @@ Describe 'attach --detached (0005)' {
 }
 
 Describe 'ZMX_HOLD_UNTIL_ATTACH (0013)' {
-    BeforeEach { New-ZmxSandbox; $script:Ran = Join-Path $script:ZmxDir 'ran' }
+    BeforeEach { New-ZmxSandbox; $script:Ran = Join-Path $TestDrive "ran-$(New-Guid)" }
     AfterEach { Remove-ZmxSandbox }
 
     It 'runs the command only once a terminal attaches' {
@@ -78,7 +79,7 @@ Describe 'ZMX_HOLD_UNTIL_ATTACH (0013)' {
     }
 
     It 'does not pass the variable to the command' {
-        $seen = Join-Path $script:ZmxDir 'seen'
+        $seen = Join-Path $TestDrive "seen-$(New-Guid)"
         Invoke-ZmxProcess -Arguments @('attach', '--detached', 't-hold-env', 'cmd.exe', '/c', 'set', 'ZMX_HOLD', '>', $seen) -Environment @{ ZMX_HOLD_UNTIL_ATTACH = '1' } | Out-Null
         Wait-ZmxSession t-hold-env
         Wait-Until { (Test-Path $seen) -and (Get-Item $seen).Length -ge 0 } 'the command to run' 15
