@@ -13,6 +13,8 @@
   Sponsored by <a href="https://pico.sh">pico.sh</a>
 </p>
 
+> This is **zmx-win**, a fork that runs zmx on Windows and carries agterm's zmx patches. See [WINDOWS.md](WINDOWS.md).
+
 ## features
 
 - Persist terminal shell sessions
