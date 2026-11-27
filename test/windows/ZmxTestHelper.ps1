@@ -138,8 +138,11 @@ function Get-ZmxCount([string]$Name, [string]$Needle) {
 
 # The words of a command that prints $Left$Right, assembled at runtime so that the marker shows up in history only
 # as program output, never in the echoed command line. Words, because `zmx run` quotes an argument with a space.
+# cmd expands %var% when it reads the whole line, so each $Left gets a variable of its own: a reused one would
+# print the value an earlier line set.
 function Get-ZmxEchoSplit([string]$Left, [string]$Right) {
-    if ((Get-ZmxShellKind) -eq 'cmd') { @('set', "zx=$Left&&", 'call', 'echo', "%zx%$Right") } else { @('Write-Output', "('$Left'+'$Right')") }
+    $var = 'zx' + ($Left -replace '\W', '')
+    if ((Get-ZmxShellKind) -eq 'cmd') { @('set', "$var=$Left&&", 'call', 'echo', "%$var%$Right") } else { @('Write-Output', "('$Left'+'$Right')") }
 }
 
 # A client that speaks the attach handshake over the session's AF_UNIX socket and holds it open, standing in for
