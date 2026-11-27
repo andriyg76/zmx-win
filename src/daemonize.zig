@@ -96,24 +96,39 @@ fn exec(sesh_name: []const u8, cmd: Cmd) !noreturn {
     _ = cross.unsetenv("ZMX_MANAGED_CLAIM");
     // the record is the daemon's to write; a nested session must not write its own exit into it
     _ = cross.unsetenv("ZMX_EXIT_FILE");
+    _ = cross.unsetenv("ZMX_HOLD_UNTIL_ATTACH");
 
     const err = lib_posix.execvpeZ(cmd.file, cmd.argv_ptr, std.c.environ);
     std.log.err("execvpe failed: cmd={s} err={s}", .{ cmd.file, @errorName(err) });
     lib_posix.exit(1);
 }
 
+/// awaitRelease parks the forked child until the daemon writes one byte to the gate. The gate closing
+/// without it (a kill, or the daemon gone) ends the child before the command runs.
+fn awaitRelease(gate: [2]lib_posix.fd_t) void {
+    // the child's copy of the write end would keep the gate open after the daemon is gone
+    lib_posix.close(gate[1]);
+    var byte: [1]u8 = undefined;
+    const n = lib_posix.read(gate[0], &byte) catch 0;
+    if (n != 1) lib_posix.exit(1);
+    lib_posix.close(gate[0]);
+}
+
 pub const PtyInfo = struct {
     master_fd: c_int = undefined,
     pid: c_int = undefined,
+    /// the write end of a held child's gate, -1 when the child runs at once
+    hold_fd: c_int = -1,
 };
 
 /// spawnPty runs forkpty() and executes the shell or shell command the user
-/// provides.
+/// provides. With `hold`, the child waits before exec until the daemon releases it through
+/// `PtyInfo.hold_fd`.
 ///
 /// This is the second fork in the double-fork technique explained in the
 /// daemonize() comment.
-pub fn spawnPty(sesh_name: []const u8, cmd: Cmd, size: ipc.Resize) !PtyInfo {
-    if (is_windows) return win.spawnConsole(sesh_name, cmd, size);
+pub fn spawnPty(sesh_name: []const u8, cmd: Cmd, size: ipc.Resize, hold: bool) !PtyInfo {
+    if (is_windows) return win.spawnConsole(sesh_name, cmd, size, hold);
     var ws: cross.struct_winsize = .{
         .ws_row = size.rows,
         .ws_col = size.cols,
@@ -121,13 +136,19 @@ pub fn spawnPty(sesh_name: []const u8, cmd: Cmd, size: ipc.Resize) !PtyInfo {
         .ws_ypixel = size.ypixel,
     };
 
+    const gate: ?[2]lib_posix.fd_t = if (hold) try lib_posix.pipe2(.{ .CLOEXEC = true }) else null;
     var master_fd: c_int = undefined;
     const pid = cross.forkpty(&master_fd, null, null, &ws);
     if (pid < 0) {
+        if (gate) |g| {
+            lib_posix.close(g[0]);
+            lib_posix.close(g[1]);
+        }
         return error.ForkPtyFailed;
     }
 
     if (pid == 0) { // child pid code path
+        if (gate) |g| awaitRelease(g);
         // In the forked child, ANY error must exit rather than propagate:
         // a returned error falls through to the parent code path below,
         // running a second daemon on the same socket (or worse, hitting
@@ -139,7 +160,8 @@ pub fn spawnPty(sesh_name: []const u8, cmd: Cmd, size: ipc.Resize) !PtyInfo {
         unreachable; // exec() either execs or exits, never returns ok
     }
     // master pid code path
-    std.log.info("pty spawned session={s} pid={d}", .{ sesh_name, pid });
+    std.log.info("pty spawned session={s} pid={d} held={}", .{ sesh_name, pid, hold });
+    if (gate) |g| lib_posix.close(g[0]);
 
     // make pty non-blocking
     const flags = try lib_posix.fcntl(master_fd, lib_posix.F.GETFL, 0);
@@ -148,6 +170,7 @@ pub fn spawnPty(sesh_name: []const u8, cmd: Cmd, size: ipc.Resize) !PtyInfo {
     return .{
         .master_fd = master_fd,
         .pid = pid,
+        .hold_fd = if (gate) |g| g[1] else -1,
     };
 }
 
@@ -209,8 +232,8 @@ fn awaitDetach(fd: i32, timeout_ms: i32) Detach {
 ///                 ✝          │ PID≠SID → can't get a tty
 ///                            ▼
 ///                          DAEMON ✓
-pub fn daemonize(sesh_name: []const u8, cmd: Cmd, keep_fds_open: []i32) !PtyInfo {
-    if (is_windows) return win.daemonize(sesh_name, cmd);
+pub fn daemonize(sesh_name: []const u8, cmd: Cmd, keep_fds_open: []i32, hold: bool) !PtyInfo {
+    if (is_windows) return win.daemonize(sesh_name, cmd, hold);
     const ack = try lib_posix.pipe2(.{ .CLOEXEC = true });
     // creates the daemon
     const pid = try lib_posix.fork();
@@ -287,7 +310,66 @@ pub fn daemonize(sesh_name: []const u8, cmd: Cmd, keep_fds_open: []i32) !PtyInfo
         }
     }
 
-    return spawnPty(sesh_name, cmd, term_size);
+    return spawnPty(sesh_name, cmd, term_size, hold);
+}
+
+fn readUntil(fd: c_int, want: []const u8, buf: []u8, wait_ms: i32) ![]const u8 {
+    var len: usize = 0;
+    var waited: i32 = 0;
+    while (waited < wait_ms) : (waited += 20) {
+        if (std.mem.indexOf(u8, buf[0..len], want) != null) break;
+        var pfd = [_]lib_posix.pollfd{.{ .fd = fd, .events = lib_posix.POLL.IN, .revents = 0 }};
+        if ((lib_posix.poll(&pfd, 20) catch 0) == 0) continue;
+        const n = lib_posix.read(fd, buf[len..]) catch break;
+        if (n == 0) break;
+        len += n;
+    }
+    return buf[0..len];
+}
+
+test "a held child runs its command only once released, without the hold variable" {
+    if (is_windows) return error.SkipZigTest; // forkpty and /bin/sh; conpty.zig tests the Windows gate
+    _ = cross.putenv(@constCast("ZMX_HOLD_UNTIL_ATTACH=5"));
+    defer _ = cross.unsetenv("ZMX_HOLD_UNTIL_ATTACH");
+    const cmd = try createCmdZ("/bin/sh", false, &.{ "/bin/sh", "-c", "printf 'ran:%s' \"${ZMX_HOLD_UNTIL_ATTACH-unset}\"" });
+    const info = try spawnPty("hold-test", cmd, .{ .rows = 24, .cols = 80 }, true);
+    defer lib_posix.close(info.master_fd);
+    try std.testing.expect(info.hold_fd >= 0);
+    const fd_flags = try lib_posix.fcntl(info.hold_fd, lib_posix.F.GETFD, 0);
+    try std.testing.expect(fd_flags & std.posix.FD_CLOEXEC != 0);
+
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("", try readUntil(info.master_fd, "ran:", &buf, 300));
+
+    _ = try lib_posix.write(info.hold_fd, "1");
+    lib_posix.close(info.hold_fd);
+    const out = try readUntil(info.master_fd, "ran:unset", &buf, 3000);
+    try std.testing.expect(std.mem.indexOf(u8, out, "ran:unset") != null);
+    _ = lib_posix.waitpid(info.pid, 0);
+}
+
+test "a held child whose gate closes without release exits before its command" {
+    if (is_windows) return error.SkipZigTest; // forkpty and /bin/sh; conpty.zig tests the Windows gate
+    const cmd = try createCmdZ("/bin/sh", false, &.{ "/bin/sh", "-c", "printf ran" });
+    const info = try spawnPty("hold-test", cmd, .{ .rows = 24, .cols = 80 }, true);
+    defer lib_posix.close(info.master_fd);
+    lib_posix.close(info.hold_fd);
+    const status = lib_posix.waitpid(info.pid, 0).status;
+    try std.testing.expect(std.posix.W.IFEXITED(status));
+    try std.testing.expectEqual(@as(u8, 1), std.posix.W.EXITSTATUS(status));
+    var buf: [256]u8 = undefined;
+    try std.testing.expect(std.mem.indexOf(u8, try readUntil(info.master_fd, "ran", &buf, 200), "ran") == null);
+}
+
+test "a child spawned without a hold has no gate" {
+    if (is_windows) return error.SkipZigTest; // forkpty and /bin/sh; conpty.zig tests the Windows gate
+    const cmd = try createCmdZ("/bin/sh", false, &.{ "/bin/sh", "-c", "printf ran" });
+    const info = try spawnPty("hold-test", cmd, .{ .rows = 24, .cols = 80 }, false);
+    defer lib_posix.close(info.master_fd);
+    try std.testing.expectEqual(@as(c_int, -1), info.hold_fd);
+    var buf: [256]u8 = undefined;
+    try std.testing.expect(std.mem.indexOf(u8, try readUntil(info.master_fd, "ran", &buf, 3000), "ran") != null);
+    _ = lib_posix.waitpid(info.pid, 0);
 }
 
 /// Windows has no fork, so a client starts the daemon as `zmx __daemon`, a fresh process given the session,
@@ -305,13 +387,15 @@ pub const win = struct {
     /// The exit code of a `zmx __daemon` that lost the race for its session's socket.
     pub const exit_address_in_use: u8 = 3;
 
-    pub fn daemonize(sesh_name: []const u8, cmd: Cmd) !PtyInfo {
-        if (child) |c| return spawnConsole(sesh_name, cmd, .{ .rows = c.rows, .cols = c.cols });
-        try startDaemon(sesh_name, cmd);
+    /// A client hands `hold` to `zmx __daemon` as its HOLD argument, the ZMX_HOLD_UNTIL_ATTACH seconds it was
+    /// created with, since that daemon is a new process rather than a fork carrying the client's state over.
+    pub fn daemonize(sesh_name: []const u8, cmd: Cmd, hold: bool) !PtyInfo {
+        if (child) |c| return spawnConsole(sesh_name, cmd, .{ .rows = c.rows, .cols = c.cols }, hold);
+        try startDaemon(sesh_name, cmd, hold);
         return error.IsClientProc;
     }
 
-    fn startDaemon(sesh_name: []const u8, cmd: Cmd) !void {
+    fn startDaemon(sesh_name: []const u8, cmd: Cmd, hold: bool) !void {
         const gpa = std.heap.c_allocator;
         const size = ipc.getTerminalSize(lib_posix.STDOUT_FILENO);
 
@@ -332,6 +416,8 @@ pub const win = struct {
             try std.fmt.bufPrint(&rows_buf, "{d}", .{size.rows}),
             try std.fmt.bufPrint(&cols_buf, "{d}", .{size.cols}),
             if (task_mode) "task" else "session",
+            // hold is only requested by a detached create, which validated ZMX_HOLD_UNTIL_ATTACH already
+            if (hold) std.mem.span(cross.getenv("ZMX_HOLD_UNTIL_ATTACH") orelse return error.NoHoldSeconds) else "0",
             "--",
         });
         var i: usize = 0;
@@ -382,7 +468,7 @@ pub const win = struct {
         return error.DaemonStartTimeout;
     }
 
-    pub fn spawnConsole(sesh_name: []const u8, cmd: Cmd, size: ipc.Resize) !PtyInfo {
+    pub fn spawnConsole(sesh_name: []const u8, cmd: Cmd, size: ipc.Resize, hold: bool) !PtyInfo {
         const gpa = std.heap.c_allocator;
         const session_env = try std.fmt.allocPrintSentinel(gpa, "ZMX_SESSION={s}", .{sesh_name}, 0);
         _ = cross.putenv(session_env.ptr);
@@ -394,14 +480,15 @@ pub const win = struct {
         _ = cross.unsetenv("ZMX_MANAGED");
         _ = cross.unsetenv("ZMX_MANAGED_CLAIM");
         _ = cross.unsetenv("ZMX_EXIT_FILE");
+        _ = cross.unsetenv("ZMX_HOLD_UNTIL_ATTACH");
 
         var argv: std.ArrayList([]const u8) = .empty;
         defer argv.deinit(gpa);
         var i: usize = 0;
         while (cmd.argv_ptr[i]) |arg| : (i += 1) try argv.append(gpa, std.mem.span(arg));
-        const spawned = try conpty.spawn(argv.items, size.rows, size.cols);
-        std.log.info("pty spawned session={s} pid={d}", .{ sesh_name, spawned.pid });
-        return .{ .master_fd = spawned.fd, .pid = spawned.pid };
+        const spawned = try conpty.spawn(argv.items, size.rows, size.cols, hold);
+        std.log.info("pty spawned session={s} pid={d} held={}", .{ sesh_name, spawned.pid, hold });
+        return .{ .master_fd = spawned.fd, .pid = spawned.pid, .hold_fd = spawned.hold_fd };
     }
 };
 

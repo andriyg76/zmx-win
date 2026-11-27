@@ -28,6 +28,8 @@ pub const CreateOptions = struct {
     labels: ?[]const u8 = null,
     is_task_mode: bool = false,
     quiet: bool = false,
+    /// with a value, the command waits until the first terminal attaches, at most this many seconds
+    hold_seconds: ?u32 = null,
 };
 
 pub const AttachOptions = struct {
@@ -93,6 +95,7 @@ pub fn create(alloc: Allocator, io: Io, name: []const u8, opts: CreateOptions) !
     if (opts.shell) |sh| daemon.shell = sh;
     daemon.is_task_mode = opts.is_task_mode;
     daemon.quiet = opts.quiet;
+    daemon.hold_seconds = opts.hold_seconds;
 
     const is_daemon_proc = try daemon.ensureSession(io);
     if (is_daemon_proc) {

@@ -200,11 +200,16 @@ fn mainImpl(init: std.process.Init) !void {
         defer gpa.free(env_str);
 
         if (parsed.detached) {
+            const hold: ?u32 = if (lib_posix.getenv("ZMX_HOLD_UNTIL_ATTACH")) |value|
+                parseHoldSeconds(value) catch return printError(io, "invalid ZMX_HOLD_UNTIL_ATTACH \"{s}\": want whole seconds above zero", .{value})
+            else
+                null;
             const created = zmx.create(gpa, io, parsed.session_name, .{
                 .command = command,
                 .cwd = cwd,
                 .shell = shell_env,
                 .labels = parsed.labels,
+                .hold_seconds = hold,
             }) catch |err| return printError(io, "cannot create session \"{s}\": {s}", .{ parsed.session_name, @errorName(err) });
             if (!created) return printError(io, "session \"{s}\" exists", .{parsed.session_name});
             return;
@@ -1369,6 +1374,20 @@ fn send(alloc: std.mem.Allocator, io: std.Io, session_name: []const u8, text_par
     };
 }
 
+fn parseHoldSeconds(value: []const u8) !u32 {
+    const seconds = try std.fmt.parseInt(u32, value, 10);
+    if (seconds == 0) return error.InvalidHold;
+    return seconds;
+}
+
+test "parseHoldSeconds takes whole seconds above zero and nothing else" {
+    try std.testing.expectEqual(@as(u32, 5), try parseHoldSeconds("5"));
+    try std.testing.expectEqual(@as(u32, 30), try parseHoldSeconds("30"));
+    for ([_][]const u8{ "", "0", "-1", "1.5", "abc", " 5", "99999999999" }) |bad| {
+        try std.testing.expect(std.meta.isError(parseHoldSeconds(bad)));
+    }
+}
+
 test "parseAttachArgs reads a bare session name" {
     const parsed = parseAttachArgs(&.{"dev"});
     try std.testing.expectEqualStrings("dev", parsed.session_name);
@@ -1480,14 +1499,16 @@ fn defaultShell(gpa: std.mem.Allocator) []const u8 {
 }
 extern "kernel32" fn SearchPathW(path: ?[*:0]const u16, file: [*:0]const u16, ext: ?[*:0]const u16, n: u32, buf: [*]u16, part: ?*?[*:0]u16) callconv(.winapi) u32;
 
-/// `zmx __daemon NAME ROWS COLS task|session -- ARGV...`, which a Windows client runs in place of forking:
+/// `zmx __daemon NAME ROWS COLS task|session HOLD -- ARGV...`, which a Windows client runs in place of forking:
 /// it creates the session NAME running ARGV in a pseudo console of ROWS x COLS and serves it until it ends.
+/// A HOLD above zero keeps ARGV from running until a terminal attaches, for at most HOLD seconds.
 fn windowsDaemon(gpa: std.mem.Allocator, io: std.Io, cfg: *Cfg, args: anytype) !void {
     const daemonize = @import("daemonize.zig");
     const sesh = args.next() orelse return error.InvalidArgs;
     const rows = std.fmt.parseInt(u16, args.next() orelse return error.InvalidArgs, 10) catch return error.InvalidArgs;
     const cols = std.fmt.parseInt(u16, args.next() orelse return error.InvalidArgs, 10) catch return error.InvalidArgs;
     const mode = args.next() orelse return error.InvalidArgs;
+    const hold = std.fmt.parseInt(u32, args.next() orelse return error.InvalidArgs, 10) catch return error.InvalidArgs;
     if (!std.mem.eql(u8, args.next() orelse "", "--")) return error.InvalidArgs;
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(gpa);
@@ -1500,6 +1521,7 @@ fn windowsDaemon(gpa: std.mem.Allocator, io: std.Io, cfg: *Cfg, args: anytype) !
     var daemon = loop.Daemon.init(io, cfg, sesh, socket_path);
     daemon.command = argv.items;
     daemon.is_task_mode = std.mem.eql(u8, mode, "task");
+    daemon.hold_seconds = if (hold > 0) hold else null;
     daemon.quiet = true;
     // The client started this process in the session's directory; a forked daemon keeps the client's setCwd instead.
     var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;

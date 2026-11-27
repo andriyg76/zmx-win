@@ -21,11 +21,13 @@ const Pty = struct {
 /// A daemon runs one session, so it has at most one pseudo console.
 var session: ?*Pty = null;
 
-pub const Spawned = struct { fd: posix.fd_t, pid: i32 };
+/// `hold_fd` is the daemon's end of a held shell's gate, -1 when the shell runs at once.
+pub const Spawned = struct { fd: posix.fd_t, pid: i32, hold_fd: posix.fd_t = -1 };
 
 /// Starts `argv` under a new pseudo console of `rows` x `cols`, in the current directory and environment.
-/// The first argument may be a bare program name, which Windows looks up on PATH.
-pub fn spawn(argv: []const []const u8, rows: u16, cols: u16) !Spawned {
+/// The first argument may be a bare program name, which Windows looks up on PATH. With `hold`, the shell stays
+/// suspended until the daemon writes a byte to `hold_fd`, and is terminated unrun if the gate closes first.
+pub fn spawn(argv: []const []const u8, rows: u16, cols: u16, hold: bool) !Spawned {
     const gpa = std.heap.c_allocator;
     var in_r: api.HANDLE = undefined;
     var in_w: api.HANDLE = undefined;
@@ -78,9 +80,16 @@ pub fn spawn(argv: []const []const u8, rows: u16, cols: u16) !Spawned {
     if (api.AssignProcessToJobObject(job, pi.hProcess) == 0) {
         std.log.warn("AssignProcessToJobObject failed err={d}", .{api.GetLastError()});
     }
-    // started suspended so that nothing it spawns escapes the job
-    _ = api.ResumeThread(pi.hThread);
-    _ = api.CloseHandle(pi.hThread);
+    // started suspended so that nothing it spawns escapes the job; a held shell stays so until its gate opens
+    var hold_fd: posix.fd_t = -1;
+    if (hold) {
+        const gate = try posix.socketPair();
+        hold_fd = try posix.adoptSocket(gate[0]);
+        (try std.Thread.spawn(.{}, awaitRelease, .{ gate[1], pi.hThread, pi.hProcess })).detach();
+    } else {
+        _ = api.ResumeThread(pi.hThread);
+        _ = api.CloseHandle(pi.hThread);
+    }
 
     const pair = try posix.socketPair();
     const pty = try gpa.create(Pty);
@@ -104,7 +113,20 @@ pub fn spawn(argv: []const []const u8, rows: u16, cols: u16) !Spawned {
     (try std.Thread.spawn(.{}, pumpOutput, .{pty})).detach();
     (try std.Thread.spawn(.{}, pumpInput, .{pty})).detach();
     (try std.Thread.spawn(.{}, watchExit, .{pty})).detach();
-    return .{ .fd = fd, .pid = @intCast(pi.dwProcessId) };
+    return .{ .fd = fd, .pid = @intCast(pi.dwProcessId), .hold_fd = hold_fd };
+}
+
+/// The Windows side of daemonize's awaitRelease: one byte on the gate resumes the suspended shell, and the gate
+/// closing without it (a kill, or the daemon gone) ends the shell before it runs.
+fn awaitRelease(gate: api.SOCKET, thread: api.HANDLE, process: api.HANDLE) void {
+    var byte: [1]u8 = undefined;
+    if (api.recv(gate, &byte, 1, 0) == 1) {
+        _ = api.ResumeThread(thread);
+    } else {
+        _ = api.TerminateProcess(process, 1);
+    }
+    _ = api.CloseHandle(thread);
+    _ = api.closesocket(gate);
 }
 
 /// Pseudo console output to the daemon. It ends when the pseudo console closes after the shell exits, and
