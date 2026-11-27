@@ -151,6 +151,21 @@ pub fn spawnPty(sesh_name: []const u8, cmd: Cmd, size: ipc.Resize) !PtyInfo {
     };
 }
 
+/// Detach is what the parent learns of the child's setsid through the acknowledgement pipe.
+const Detach = enum { detached, gone, unknown };
+
+/// awaitDetach waits for the child's acknowledgement byte. A parent that leads its terminal's
+/// session would SIGHUP a child still in its group by exiting, so it must not exit before the
+/// child's setsid. EOF without the byte means the child died first; a timeout says nothing.
+fn awaitDetach(fd: i32, timeout_ms: i32) Detach {
+    var fds = [_]lib_posix.pollfd{.{ .fd = fd, .events = lib_posix.POLL.IN, .revents = 0 }};
+    const ready = lib_posix.poll(&fds, timeout_ms) catch return .unknown;
+    if (ready == 0) return .unknown;
+    var byte: [1]u8 = undefined;
+    const n = lib_posix.read(fd, &byte) catch return .unknown;
+    return if (n == 1) .detached else .gone;
+}
+
 /// daemonize is the first fork in a double-fork technique to create a
 /// completely disconnected session (container of process groups).
 ///
@@ -196,11 +211,17 @@ pub fn spawnPty(sesh_name: []const u8, cmd: Cmd, size: ipc.Resize) !PtyInfo {
 ///                          DAEMON ✓
 pub fn daemonize(sesh_name: []const u8, cmd: Cmd, keep_fds_open: []i32) !PtyInfo {
     if (is_windows) return win.daemonize(sesh_name, cmd);
+    const ack = try lib_posix.pipe2(.{ .CLOEXEC = true });
     // creates the daemon
     const pid = try lib_posix.fork();
     assert(pid != -1);
 
     if (pid > 0) { // parent (client)
+        lib_posix.close(ack[1]);
+        const detach = awaitDetach(ack[0], 1000);
+        lib_posix.close(ack[0]);
+        // a slow child may still detach and serve, so only a child known dead fails the create
+        if (detach == .gone) return error.DaemonExited;
         // cannot use a passed-in io or alloc after a fork so we create what we need
         // after the fork()
         var threaded: std.Io.Threaded = .init_single_threaded;
@@ -211,8 +232,11 @@ pub fn daemonize(sesh_name: []const u8, cmd: Cmd, keep_fds_open: []i32) !PtyInfo
     }
 
     assert(pid == 0); // child (daemon's parent in double-fork)
+    lib_posix.close(ack[0]);
     // becomes the session leader and detaches process from its controlling terminal
     _ = try lib_posix.setsid();
+    _ = lib_posix.write(ack[1], "d") catch {};
+    lib_posix.close(ack[1]);
 
     // Fetch terminal size before redirecting stdio FDs to /dev/null.
     const term_size = ipc.getTerminalSize(lib_posix.STDOUT_FILENO);
@@ -380,3 +404,23 @@ pub const win = struct {
         return .{ .master_fd = spawned.fd, .pid = spawned.pid };
     }
 };
+
+test "awaitDetach reads the acknowledgement, a child gone before it, and silence" {
+    // Windows starts the daemon as `zmx __daemon` and waits for its socket, with no fork to acknowledge
+    if (is_windows) return error.SkipZigTest;
+    const written = try lib_posix.pipe2(.{ .CLOEXEC = true });
+    _ = try lib_posix.write(written[1], "d");
+    lib_posix.close(written[1]);
+    try std.testing.expectEqual(Detach.detached, awaitDetach(written[0], 1000));
+    lib_posix.close(written[0]);
+
+    const closed = try lib_posix.pipe2(.{ .CLOEXEC = true });
+    lib_posix.close(closed[1]);
+    try std.testing.expectEqual(Detach.gone, awaitDetach(closed[0], 1000));
+    lib_posix.close(closed[0]);
+
+    const silent = try lib_posix.pipe2(.{ .CLOEXEC = true });
+    try std.testing.expectEqual(Detach.unknown, awaitDetach(silent[0], 10));
+    lib_posix.close(silent[0]);
+    lib_posix.close(silent[1]);
+}
