@@ -134,3 +134,28 @@ function Connect-ZmxSession([string]$Name, [uint16]$Rows = 24, [uint16]$Cols = 8
     $s.Send([byte[]]($header + $payload)) | Out-Null
     $s
 }
+
+# every test file dot-sources this, and a type is added once per PowerShell session
+if (-not ('ZmxConPty' -as [type])) { Add-Type -Path (Join-Path $PSScriptRoot 'ZmxConPty.cs') }
+
+# The shell a terminal pane runs: ZMX_TEST_SHELL, else the PowerShell zmx picks itself.
+function Get-ZmxPaneShell { if ($env:ZMX_TEST_SHELL) { $env:ZMX_TEST_SHELL } else { 'powershell.exe' } }
+
+# `zmx attach <name> <command...>` in a process of its own under a pseudo console, as agterm-win starts a Live pane:
+# it creates the session with that command, or attaches to the one already there. Dispose it to end the client.
+function Start-ZmxAttach([string]$Name, [string[]]$Command = @(), [int16]$Rows = 24, [int16]$Cols = 80) {
+    $environment = @{}
+    foreach ($e in [Environment]::GetEnvironmentVariables().GetEnumerator()) {
+        if ($e.Key -notlike 'ZMX_*' -and $e.Key -ne 'SHELL') { $environment[$e.Key] = $e.Value }
+    }
+    $environment['ZMX_DIR'] = $script:ZmxDir
+    $environment['ZMX_NO_DETACH_KEY'] = '1'
+    if ($env:ZMX_TEST_SHELL) { $environment['SHELL'] = $env:ZMX_TEST_SHELL }
+    $line = (@($script:ZmxExe, 'attach', $Name) + $Command | ForEach-Object { if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } }) -join ' '
+    [ZmxConPty]::new($line, $environment, $script:RepoDir, $Rows, $Cols)
+}
+
+# The processes the session's daemon started, conhost aside: the shell it runs.
+function Get-ZmxDaemonChildren([int]$DaemonId) {
+    @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$DaemonId" | Where-Object { $_.Name -notin 'conhost.exe', 'OpenConsole.exe' })
+}
