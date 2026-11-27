@@ -73,6 +73,8 @@ pub fn spawn(argv: []const []const u8, rows: u16, cols: u16, hold: bool) !Spawne
         api.ClosePseudoConsole(hpc);
         return error.SpawnFailed;
     }
+    // a shell left suspended by a failure below would never run or exit, and one already resumed has no session
+    errdefer _ = api.TerminateProcess(pi.hProcess, 1);
     const job = api.CreateJobObjectW(null, null) orelse return error.JobFailed;
     var limits: api.JOBOBJECT_EXTENDED_LIMIT_INFORMATION = .{};
     limits.BasicLimitInformation.LimitFlags = api.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
@@ -82,6 +84,8 @@ pub fn spawn(argv: []const []const u8, rows: u16, cols: u16, hold: bool) !Spawne
     }
     // started suspended so that nothing it spawns escapes the job; a held shell stays so until its gate opens
     var hold_fd: posix.fd_t = -1;
+    // closing the daemon's end lets the gate's thread see the close and end
+    errdefer if (hold_fd >= 0) posix.close(hold_fd);
     if (hold) {
         const gate = try posix.socketPair();
         hold_fd = try posix.adoptSocket(gate[0]);
