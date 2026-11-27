@@ -328,7 +328,7 @@ fn readUntil(fd: c_int, want: []const u8, buf: []u8, wait_ms: i32) ![]const u8 {
 }
 
 test "a held child runs its command only once released, without the hold variable" {
-    if (is_windows) return error.SkipZigTest; // forkpty and /bin/sh; conpty.zig tests the Windows gate
+    if (is_windows) return error.SkipZigTest; // forkpty and /bin/sh; agterm.Tests.ps1 covers the Windows gate
     _ = cross.putenv(@constCast("ZMX_HOLD_UNTIL_ATTACH=5"));
     defer _ = cross.unsetenv("ZMX_HOLD_UNTIL_ATTACH");
     const cmd = try createCmdZ("/bin/sh", false, &.{ "/bin/sh", "-c", "printf 'ran:%s' \"${ZMX_HOLD_UNTIL_ATTACH-unset}\"" });
@@ -349,7 +349,7 @@ test "a held child runs its command only once released, without the hold variabl
 }
 
 test "a held child whose gate closes without release exits before its command" {
-    if (is_windows) return error.SkipZigTest; // forkpty and /bin/sh; conpty.zig tests the Windows gate
+    if (is_windows) return error.SkipZigTest; // forkpty and /bin/sh; agterm.Tests.ps1 covers the Windows gate
     const cmd = try createCmdZ("/bin/sh", false, &.{ "/bin/sh", "-c", "printf ran" });
     const info = try spawnPty("hold-test", cmd, .{ .rows = 24, .cols = 80 }, true);
     defer lib_posix.close(info.master_fd);
@@ -362,7 +362,7 @@ test "a held child whose gate closes without release exits before its command" {
 }
 
 test "a child spawned without a hold has no gate" {
-    if (is_windows) return error.SkipZigTest; // forkpty and /bin/sh; conpty.zig tests the Windows gate
+    if (is_windows) return error.SkipZigTest; // forkpty and /bin/sh; agterm.Tests.ps1 covers the Windows gate
     const cmd = try createCmdZ("/bin/sh", false, &.{ "/bin/sh", "-c", "printf ran" });
     const info = try spawnPty("hold-test", cmd, .{ .rows = 24, .cols = 80 }, false);
     defer lib_posix.close(info.master_fd);
