@@ -18,7 +18,12 @@ Describe 'attach --detached (0005)' {
         $r.Code | Should -Be 0
         Wait-ZmxSession t-detached
         Get-ZmxField t-detached clients | Should -Be '0'
-        Wait-Until { Test-Path $ran } 'the command to run'
+        try {
+            Wait-Until { Test-Path $ran } 'the command to run'
+        } finally {
+            Save-ZmxArtifact 'history.txt' (zmx history t-detached).Output
+            Save-ZmxArtifact 'create.txt' $r.Output
+        }
     }
 
     It 'refuses a session that exists' {
