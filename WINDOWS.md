@@ -7,6 +7,27 @@ for [agterm-win](https://github.com/andriyg76/agterm-win), the Windows port of
 The `windows` branch is upstream zmx v1.0.1 (`a35f00a`) plus two series of commits on top of it. Upstream files
 change only where Windows needs it, so a later upstream release can be rebased in.
 
+## Use zmx-win on its own
+
+zmx-win works without agterm-win in any Windows terminal, Windows Terminal included.
+
+1. Download `zmx-x64.exe` or `zmx-arm64.exe` from the [latest release](https://github.com/andriyg76/zmx-win/releases/latest) and check it against `zmx.sha256`.
+2. Rename it to `zmx.exe` and put it in a folder on your `PATH`.
+3. Start or reattach a session:
+
+```powershell
+zmx attach work            # PowerShell, the default shell
+zmx attach build cmd.exe   # any other command
+zmx list                   # sessions and their clients
+zmx detach                 # detach every client; closing the window detaches too
+zmx history work           # the session's scrollback as text
+zmx kill build
+```
+
+The session keeps running after you detach or close the window, and `zmx attach` with the same name brings its screen back.
+`zmx version` prints the socket and log folders. The commands are upstream's; [zmx.sh](https://zmx.sh) documents them.
+For persistent sessions in a sidebar terminal with a control API, use [agterm-win](https://github.com/andriyg76/agterm-win), which bundles this zmx.
+
 ## agterm's zmx patches
 
 agterm builds zmx from upstream with the patches in its
