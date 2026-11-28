@@ -7,6 +7,39 @@ for [agterm-win](https://github.com/andriyg76/agterm-win), the Windows port of
 The `windows` branch is upstream zmx v1.0.1 (`a35f00a`) plus two series of commits on top of it. Upstream files
 change only where Windows needs it, so a later upstream release can be rebased in.
 
+It is not a vanilla port of upstream zmx: it is zmx as agterm ships it.
+
+- **agterm's patches included.** The same zmx patch series agterm applies on macOS and Linux is built in
+  ([table below](#agterms-zmx-patches)): explicit leadership, detached create, hold until attach, output drained
+  on exit, reclaiming a dropped lead, and more. A session behaves as an agterm Live session does on a Mac.
+- **Tested on Windows.** A [Pester](https://pester.dev/) integration suite runs on every change on windows-2022,
+  windows-2025 and windows-11-arm, and against each published x64 and arm64 release build, with PowerShell and cmd
+  as the session shell. It drives real
+  ConPTY sessions through create, attach from a second process, detach and re-attach at a new size, `run`, `send`,
+  `print`, `write`, `history`, `wait`, `kill`, labels, cwd tracking over OSC 7, argument quoting, and agterm's
+  detached-create and hold-until-attach patches ([Tests and releases](#tests-and-releases)).
+
+## Use zmx-win on its own
+
+zmx-win works without agterm-win in any Windows terminal, Windows Terminal included.
+
+1. Download `zmx-x64.exe` or `zmx-arm64.exe` from the [latest release](https://github.com/andriyg76/zmx-win/releases/latest) and check it against `zmx.sha256`.
+2. Rename it to `zmx.exe` and put it in a folder on your `PATH`.
+3. Start or reattach a session:
+
+```powershell
+zmx attach work            # PowerShell, the default shell
+zmx attach build cmd.exe   # any other command
+zmx list                   # sessions and their clients
+zmx detach                 # detach every client; closing the window detaches too
+zmx history work           # the session's scrollback as text
+zmx kill build
+```
+
+The session keeps running after you detach or close the window, and `zmx attach` with the same name brings its screen back.
+`zmx version` prints the socket and log folders. The commands are upstream's; [zmx.sh](https://zmx.sh) documents them.
+For persistent sessions in a sidebar terminal with a control API, use [agterm-win](https://github.com/andriyg76/agterm-win), which bundles this zmx.
+
 ## agterm's zmx patches
 
 agterm builds zmx from upstream with the patches in its
