@@ -13,7 +13,7 @@
   Sponsored by <a href="https://pico.sh">pico.sh</a>
 </p>
 
-> This is **zmx-win**, a fork that runs zmx on Windows and carries agterm's zmx patches. It gives PowerShell and cmd persistent sessions you can detach from and reattach to, on x64 and ARM64. Start with [Use zmx-win on its own](WINDOWS.md#use-zmx-win-on-its-own); the rest of [WINDOWS.md](WINDOWS.md) covers the port.
+> This is **zmx-win**, a fork that runs zmx on Windows. It is not a vanilla port: it carries agterm's zmx patches, and an integration suite tests every release build on Windows x64 and ARM64 with PowerShell and cmd sessions. It gives PowerShell and cmd persistent sessions you can detach from and reattach to. Start with [Use zmx-win on its own](WINDOWS.md#use-zmx-win-on-its-own); the rest of [WINDOWS.md](WINDOWS.md) covers the port.
 
 ## features
 

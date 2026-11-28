@@ -7,6 +7,17 @@ for [agterm-win](https://github.com/andriyg76/agterm-win), the Windows port of
 The `windows` branch is upstream zmx v1.0.1 (`a35f00a`) plus two series of commits on top of it. Upstream files
 change only where Windows needs it, so a later upstream release can be rebased in.
 
+It is not a vanilla port of upstream zmx: it is zmx as agterm ships it.
+
+- **agterm's patches included.** The same zmx patch series agterm applies on macOS and Linux is built in
+  ([table below](#agterms-zmx-patches)): explicit leadership, detached create, hold until attach, output drained
+  on exit, reclaiming a dropped lead, and more. A session behaves as an agterm Live session does on a Mac.
+- **Tested on Windows.** A [Pester](https://pester.dev/) integration suite runs every release build on
+  windows-2022, windows-2025 and windows-11-arm, with PowerShell and cmd as the session shell. It drives real
+  ConPTY sessions through create, attach from a second process, detach and re-attach at a new size, `run`, `send`,
+  `print`, `write`, `history`, `wait`, `kill`, labels, cwd tracking over OSC 7, argument quoting, and agterm's
+  detached-create and hold-until-attach patches ([Tests and releases](#tests-and-releases)).
+
 ## Use zmx-win on its own
 
 zmx-win works without agterm-win in any Windows terminal, Windows Terminal included.
